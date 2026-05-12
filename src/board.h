@@ -35,3 +35,6 @@ extern const uint8_t PIEZO_ADC_CHANNELS[PIEZO_COUNT];
 /* LED pin */
 #define LED_PIN        13
 #define LED_PORT       GPIOC
+
+/* Threshold para detecção de impacto */
+#define PIEZO_THRESHOLD 1200

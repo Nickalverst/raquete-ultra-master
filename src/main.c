@@ -63,14 +63,14 @@ void compute_heatmap(uint32_t heatmap[PIEZO_COUNT], uint32_t *hit_counter)
     {
         uint16_t val = adc_read_channel(PIEZO_ADC_CHANNELS[ch]);
 
-        if (val > 500 && ch == 4)
+        if (val > PIEZO_THRESHOLD)
         {
             printf("CH %d = %d\n", ch, val);
             heatmap[ch]++;
             (*hit_counter)++;
         }
 
-        delay_ms(1);
+        //delay_ms(1);
     }
 }
 
@@ -83,7 +83,7 @@ void display_heatmap(uint8_t heatmap[PIEZO_COUNT])
         uint16_t color = red_level << 11;
         uint16_t x = (i % 3) * (LCD_W / 3);
         uint16_t y = (i / 3) * (LCD_H / 3);
-        st7789_fill_rect(x, y, LCD_W / 3, LCD_H / 3, color);
+        st7789_fill_rect_dma(x, y, LCD_W / 3, LCD_H / 3, color);
     }
 }
 
@@ -123,12 +123,12 @@ int main(void)
                 normalized_heatmap[i] = (max_value > 0) ? (heatmap[i] * 255 / max_value) : 0;
             }
             // print normalized heatmap values for debugging
-            // printf("Normalized Heatmap: ");
-            // for (int i = 0; i < PIEZO_COUNT; i++) {
-            //     printf("%d ", normalized_heatmap[i]);
-            // }
-            // printf("\n");
-            // display_heatmap(normalized_heatmap);
+            printf("Normalized Heatmap: ");
+            for (int i = 0; i < PIEZO_COUNT; i++) {
+                printf("%d ", normalized_heatmap[i]);
+            }
+            printf("\n");
+            display_heatmap(normalized_heatmap);
         }
     }
 }
