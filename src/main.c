@@ -10,58 +10,10 @@
 static inline int  uart_rx_ready(void) { return (USART1->SR & USART_SR_RXNE) != 0; }
 static inline char uart_getc(void)     { return (char)USART1->DR; }
 
-void mux_gpio_init(void)
+uint16_t adc_read_channel(uint8_t ch)
 {
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN; // Enable MUX_PORT (GPIOB)
+    ADC1->SQR3 = ch;
 
-    // Set PB5, PB6, PB13, PB14, PB15 as output
-    MUX_PORT->MODER &= ~(
-        (3u<<(MUX_S0_PIN*2)) |
-        (3u<<(MUX_S1_PIN*2)) |
-        (3u<<(MUX_S2_PIN*2)) |
-        (3u<<(MUX_S3_PIN*2)) |
-        (3u<<(MUX_EN_PIN*2))
-    );
-
-    MUX_PORT->MODER |= (
-        (1u<<(MUX_S0_PIN*2)) |
-        (1u<<(MUX_S1_PIN*2)) |
-        (1u<<(MUX_S2_PIN*2)) |
-        (1u<<(MUX_S3_PIN*2)) |
-        (1u<<(MUX_EN_PIN*2))
-    );
-
-    // Enable mux (LOW)
-    MUX_PORT->BSRR = (1u << (MUX_EN_PIN + 16));
-}
-
-void mux_select(uint8_t ch)
-{
-    // Clear/set
-    MUX_PORT->BSRR =
-                  ((ch & 0x01) ? (1u << MUX_S0_PIN) : (1u << (MUX_S0_PIN+16))) |
-                  ((ch & 0x02) ? (1u << MUX_S1_PIN) : (1u << (MUX_S1_PIN+16))) |
-                  ((ch & 0x04) ? (1u << MUX_S2_PIN) : (1u << (MUX_S2_PIN+16))) |
-                  ((ch & 0x08) ? (1u << MUX_S3_PIN) : (1u << (MUX_S3_PIN+16)));
-}
-
-void adc_init(void)
-{
-    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-
-    // PA0 analog
-    GPIOA->MODER |= (3u << (0*2));
-
-    ADC1->CR2 = 0;
-    ADC1->SQR3 = 0; // channel 0
-    ADC1->SMPR2 |= (7u << 0); // max sample time
-
-    ADC1->CR2 |= ADC_CR2_ADON;
-}
-
-uint16_t adc_read(void)
-{
     ADC1->CR2 |= ADC_CR2_SWSTART;
 
     while (!(ADC1->SR & ADC_SR_EOC));
@@ -69,54 +21,47 @@ uint16_t adc_read(void)
     return ADC1->DR;
 }
 
-void test_multiplexer(void)
+void adc_init(void)
 {
-    delay_init();
-    serial_init(115200);
-    mux_gpio_init();
-    adc_init();
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
 
-    // liga clock do GPIOC
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN |
+                    RCC_AHB1ENR_GPIOBEN |
+                    RCC_AHB1ENR_GPIOCEN;
 
-    // PC13 como saída (01)
-    GPIOC->MODER &= ~(3u << (LED_PIN*2));
-    GPIOC->MODER |=  (1u << (LED_PIN*2)); // output
+    // PA0-PA7 analog
+    GPIOA->MODER |=
+        (3u<<(0*2)) |
+        (3u<<(1*2)) |
+        (3u<<(2*2)) |
+        (3u<<(3*2)) |
+        (3u<<(4*2)) |
+        (3u<<(5*2)) |
+        (3u<<(6*2)) |
+        (3u<<(7*2));
 
-    printf("Iniciando execução.\n");
+    // PB0-PB1 analog
+    GPIOB->MODER |= (3u<<(0*2)) |
+                    (3u<<(1*2));
 
-    while (1)
-    {
-        for (uint8_t ch = 0; ch < 16; ch++)
-        {
-            mux_select(ch);
+    // PC0-PC1 analog
+    GPIOC->MODER |= (3u<<(0*2)) |
+                    (3u<<(1*2));
 
-            delay_ms(5); // settle time
+    ADC1->CR2 = 0;
 
-            uint16_t val = adc_read();
+    // Long sample time helps high impedance sensors
+    ADC1->SMPR2 = 0x3FFFFFFF;
+    ADC1->SMPR1 = 0x0000003F;
 
-            printf("CH %d = %d\n", ch, val);
-
-            if (val > 2000)
-                GPIOC->ODR |= (1u << LED_PIN);
-            else
-                GPIOC->ODR &= ~(1u << LED_PIN);
-
-            delay_ms(200);
-        }
-    }
+    ADC1->CR2 |= ADC_CR2_ADON;
 }
 
-void compute_heatmap(uint8_t heatmap[9], uint32_t *hit_counter)
+void compute_heatmap(uint32_t heatmap[9], uint32_t *hit_counter)
 {
-    // Lendo 9 canais do ADC e atualizando heatmap
     for (uint8_t ch = 0; ch < 9; ch++)
     {
-        mux_select(ch);
-
-        delay_ms(1); // settle time
-
-        uint16_t val = adc_read();
+        uint16_t val = adc_read_channel(PIEZO_ADC_CHANNELS[ch]);
 
         printf("CH %d = %d\n", ch, val);
 
@@ -126,6 +71,7 @@ void compute_heatmap(uint8_t heatmap[9], uint32_t *hit_counter)
             (*hit_counter)++;
         }
 
+        delay_ms(1);
     }
 }
 
@@ -146,27 +92,25 @@ int main(void)
 {
     delay_init();
     serial_stdio_init(115200);
-    mux_gpio_init();
     adc_init();
     st7789_init();
     st7789_set_speed_div(0);
 
-    uint8_t heatmap[9] = {0}; 
+    uint32_t heatmap[9] = {0}; 
     uint32_t hit_counter = 0;
 
     st7789_fill_screen(C_BLACK);
 
     for(;;){
         if (uart_rx_ready()){
-            char c = uart_getc();
             compute_heatmap(heatmap, &hit_counter);
             // print heatmap values for debugging
             printf("Heatmap: ");
             for (int i = 0; i < 9; i++) {
-                printf("%ld ", heatmap[i]);
+                printf("%u ", heatmap[i]);
             }
             printf("\n");
-            printf("Total hits: %ld\n", hit_counter);
+            printf("Total hits: %lu\n", hit_counter);
             // Normalize heatmap values to 0-255 range for color mapping
             uint8_t normalized_heatmap[9];
             // Get the max value from the heatmap for normalization
@@ -189,6 +133,3 @@ int main(void)
         }
     }
 }
-
-// Toggle LED:
-// GPIOC->ODR ^= (1u << 13u);

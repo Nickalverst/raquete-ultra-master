@@ -27,14 +27,10 @@
 #define C_CYAN  0x07FF
 #define C_MAG   0xF81F
 
-/* Mux pins */
-#define MUX_PORT GPIOB
-#define MUX_S0_PIN  14
-#define MUX_S1_PIN  15
-#define MUX_S2_PIN  5
-#define MUX_S3_PIN  6
-#define MUX_EN_PIN  13
-#define MUX_SIG_PIN  0
+/* Piezo ADC channels */
+#define PIEZO_COUNT 9
+
+extern const uint8_t PIEZO_ADC_CHANNELS[PIEZO_COUNT];
 
 /* LED pin */
 #define LED_PIN        13
