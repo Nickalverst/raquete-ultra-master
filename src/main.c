@@ -57,16 +57,15 @@ void adc_init(void)
     ADC1->CR2 |= ADC_CR2_ADON;
 }
 
-void compute_heatmap(uint32_t heatmap[9], uint32_t *hit_counter)
+void compute_heatmap(uint32_t heatmap[PIEZO_COUNT], uint32_t *hit_counter)
 {
-    for (uint8_t ch = 0; ch < 9; ch++)
+    for (uint8_t ch = 0; ch < PIEZO_COUNT; ch++)
     {
         uint16_t val = adc_read_channel(PIEZO_ADC_CHANNELS[ch]);
 
-        printf("CH %d = %d\n", ch, val);
-
-        if (val > 2000)
+        if (val > 500 && ch == 4)
         {
+            printf("CH %d = %d\n", ch, val);
             heatmap[ch]++;
             (*hit_counter)++;
         }
@@ -75,10 +74,10 @@ void compute_heatmap(uint32_t heatmap[9], uint32_t *hit_counter)
     }
 }
 
-void display_heatmap(uint8_t heatmap[9])
+void display_heatmap(uint8_t heatmap[PIEZO_COUNT])
 {
     // Exibe heatmap no LCD (3x3)
-    for (uint8_t i = 0; i < 9; i++)
+    for (uint8_t i = 0; i < PIEZO_COUNT; i++)
     {
         uint16_t red_level = (uint16_t)heatmap[i] * 31u / 255u;
         uint16_t color = red_level << 11;
@@ -96,7 +95,7 @@ int main(void)
     st7789_init();
     st7789_set_speed_div(0);
 
-    uint32_t heatmap[9] = {0}; 
+    uint32_t heatmap[PIEZO_COUNT] = {0}; 
     uint32_t hit_counter = 0;
 
     st7789_fill_screen(C_BLACK);
@@ -105,31 +104,31 @@ int main(void)
         if (uart_rx_ready()){
             compute_heatmap(heatmap, &hit_counter);
             // print heatmap values for debugging
-            printf("Heatmap: ");
-            for (int i = 0; i < 9; i++) {
-                printf("%u ", heatmap[i]);
-            }
-            printf("\n");
-            printf("Total hits: %lu\n", hit_counter);
+            // printf("Heatmap: ");
+            // for (int i = 0; i < PIEZO_COUNT; i++) {
+            //     printf("%u ", heatmap[i]);
+            // }
+            // printf("\n");
+            // printf("Total hits: %lu\n", hit_counter);
             // Normalize heatmap values to 0-255 range for color mapping
-            uint8_t normalized_heatmap[9];
+            uint8_t normalized_heatmap[PIEZO_COUNT];
             // Get the max value from the heatmap for normalization
             uint32_t max_value = 0;
-            for (int i = 0; i < 9; i++) {
+            for (int i = 0; i < PIEZO_COUNT; i++) {
                 if (heatmap[i] > max_value) {
                     max_value = heatmap[i];
                 }
             }
-            for (int i = 0; i < 9; i++) {
+            for (int i = 0; i < PIEZO_COUNT; i++) {
                 normalized_heatmap[i] = (max_value > 0) ? (heatmap[i] * 255 / max_value) : 0;
             }
             // print normalized heatmap values for debugging
-            printf("Normalized Heatmap: ");
-            for (int i = 0; i < 9; i++) {
-                printf("%d ", normalized_heatmap[i]);
-            }
-            printf("\n");
-            display_heatmap(normalized_heatmap);
+            // printf("Normalized Heatmap: ");
+            // for (int i = 0; i < PIEZO_COUNT; i++) {
+            //     printf("%d ", normalized_heatmap[i]);
+            // }
+            // printf("\n");
+            // display_heatmap(normalized_heatmap);
         }
     }
 }
