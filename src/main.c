@@ -4,7 +4,6 @@
 #include "board.h"
 #include "serial.h"
 #include "serial_stdio.h"
-#include "st7789.h"
 #include "../include/stm32f4xx.h"
 #include "delay.h"
 #include "mpu6050.h"
@@ -59,36 +58,6 @@ void adc_init(void)
     ADC1->CR2 |= ADC_CR2_ADON;
 }
 
-void compute_heatmap(uint32_t heatmap[PIEZO_COUNT], uint32_t *hit_counter)
-{
-    for (uint8_t ch = 0; ch < PIEZO_COUNT; ch++)
-    {
-        uint16_t val = adc_read_channel(PIEZO_ADC_CHANNELS[ch]);
-
-        if (val > PIEZO_THRESHOLD)
-        {
-            printf("CH %d = %d\n", ch, val);
-            heatmap[ch]++;
-            (*hit_counter)++;
-        }
-
-        //delay_ms(1);
-    }
-}
-
-void display_heatmap(uint8_t heatmap[PIEZO_COUNT])
-{
-    // Exibe heatmap no LCD (3x3)
-    for (uint8_t i = 0; i < PIEZO_COUNT; i++)
-    {
-        uint16_t red_level = (uint16_t)heatmap[i] * 31u / 255u;
-        uint16_t color = red_level << 11;
-        uint16_t x = (i % 3) * (LCD_W / 3);
-        uint16_t y = (i / 3) * (LCD_H / 3);
-        st7789_fill_rect_dma(x, y, LCD_W / 3, LCD_H / 3, color);
-    }
-}
-
 int main(void)
 {
     delay_init();
@@ -96,8 +65,19 @@ int main(void)
 
     printf("Starting MPU6050 setup...\n");
 
+    RCC->AHB1ENR  |= RCC_AHB1ENR_GPIOBEN;
+    GPIOB->MODER  &= ~((3u<<(8*2)) | (3u<<(9*2))); // PB8/PB9 como GPIO output
+    GPIOB->MODER  |=  ((1u<<(8*2)) | (1u<<(9*2)));
+    GPIOB->BSRR    =  (1u<<8) | (1u<<9);           // força HIGH
+    for (int i = 0; i < 9; i++) {                   // 9 pulsos de clock para destravar
+        GPIOB->BSRR = (1u<<(8+16));
+        delay_ms(1);
+        GPIOB->BSRR = (1u<<8);
+        delay_ms(1);
+    }
+
     /* PB8=SCL, PB9=SDA on I2C1 */
-    i2c1_init_100k(50000000u);
+    i2c1_init_100k(16000000u);
     delay_ms(100);
 
     uint8_t whoami;
@@ -115,16 +95,50 @@ int main(void)
         for (;;);
     }
 
-    mpu6050_raw_t imu;
+    mpu6050_raw_t    imu;
+    mpu6050_raw_t    ref;
+    float            yaw = 0.0f;
+    const float      DT  = 0.250f;   // deve bater com delay_ms(250)
+
+    // Referência de offset (posição inicial = zero)
+    mpu6050_read_all(&ref);
 
     for (;;) {
         if (mpu6050_read_all(&imu) == 0) {
-            float ax = mpu6050_accel_g(imu.ax);
-            float ay = mpu6050_accel_g(imu.ay);
-            float az = mpu6050_accel_g(imu.az);
-            printf("Accel: X=%.3fg Y=%.3fg Z=%.3fg\n", ax, ay, az);
+
+            // Subtrai offset de aceleração
+            imu.ax -= ref.ax;
+            imu.ay -= ref.ay;
+
+            // Calcula orientação completa
+            mpu6050_orientation_t ori =
+                mpu6050_orientation_update(&imu, yaw, DT);
+            yaw = ori.yaw_deg;  // preserva yaw para próxima iteração
+
+            // Converte para inteiros (sem -u _printf_float)
+            int ax_mg = (int)(mpu6050_accel_g(imu.ax) * 1000);
+            int ay_mg = (int)(mpu6050_accel_g(imu.ay) * 1000);
+            int az_mg = (int)(mpu6050_accel_g(imu.az) * 1000);
+            int roll  = (int)ori.roll_deg;
+            int pitch = (int)ori.pitch_deg;
+            int yaw_i = (int)ori.yaw_deg;
+
+            // Indicador de estado
+            const char *tilt;
+            if      (pitch >  45) tilt = "FRENTE  >>>";
+            else if (pitch < -45) tilt = "<<< ATRAS  ";
+            else if (roll  >  45) tilt = "DIREITA vvv";
+            else if (roll  < -45) tilt = "^^^ ESQUERDA";
+            else                  tilt = "PLANO  [===]";
+
+            printf("----------------------------------\r\n");
+            printf("Accel : X=%5dmg  Y=%5dmg  Z=%5dmg\r\n", ax_mg, ay_mg, az_mg);
+            printf("Roll  : %4ddeg   Pitch: %4ddeg   Yaw: %4ddeg\r\n",
+                roll, pitch, yaw_i);
+            printf("Estado: %s\r\n", tilt);
+
         } else {
-            printf("MPU6050 read failed\n");
+            printf("MPU6050 read failed\r\n");
         }
         delay_ms(250);
     }
