@@ -3,9 +3,11 @@
 #include <stdlib.h>
 #include "board.h"
 #include "serial.h"
+#include "serial_stdio.h"
+#include "st7789.h"
 #include "../include/stm32f4xx.h"
 #include "delay.h"
-#include "st7789.h"
+#include "mpu6050.h"
 
 static inline int  uart_rx_ready(void) { return (USART1->SR & USART_SR_RXNE) != 0; }
 static inline char uart_getc(void)     { return (char)USART1->DR; }
@@ -91,44 +93,39 @@ int main(void)
 {
     delay_init();
     serial_stdio_init(115200);
-    adc_init();
-    st7789_init();
-    st7789_set_speed_div(0);
 
-    uint32_t heatmap[PIEZO_COUNT] = {0}; 
-    uint32_t hit_counter = 0;
+    printf("Starting MPU6050 setup...\n");
 
-    st7789_fill_screen(C_BLACK);
+    /* PB8=SCL, PB9=SDA on I2C1 */
+    i2c1_init_100k(50000000u);
+    delay_ms(100);
 
-    for(;;){
-        if (uart_rx_ready()){
-            compute_heatmap(heatmap, &hit_counter);
-            // print heatmap values for debugging
-            // printf("Heatmap: ");
-            // for (int i = 0; i < PIEZO_COUNT; i++) {
-            //     printf("%u ", heatmap[i]);
-            // }
-            // printf("\n");
-            // printf("Total hits: %lu\n", hit_counter);
-            // Normalize heatmap values to 0-255 range for color mapping
-            uint8_t normalized_heatmap[PIEZO_COUNT];
-            // Get the max value from the heatmap for normalization
-            uint32_t max_value = 0;
-            for (int i = 0; i < PIEZO_COUNT; i++) {
-                if (heatmap[i] > max_value) {
-                    max_value = heatmap[i];
-                }
-            }
-            for (int i = 0; i < PIEZO_COUNT; i++) {
-                normalized_heatmap[i] = (max_value > 0) ? (heatmap[i] * 255 / max_value) : 0;
-            }
-            // print normalized heatmap values for debugging
-            printf("Normalized Heatmap: ");
-            for (int i = 0; i < PIEZO_COUNT; i++) {
-                printf("%d ", normalized_heatmap[i]);
-            }
-            printf("\n");
-            display_heatmap(normalized_heatmap);
+    uint8_t whoami;
+    if (i2c1_read_reg(0x68, MPU6050_REG_WHOAMI, &whoami) == 0) {
+        printf("Found MPU6050 at 0x68\n");
+    }
+    else if (i2c1_read_reg(0x69, MPU6050_REG_WHOAMI, &whoami) == 0) {
+        printf("Found MPU6050 at 0x69\n");
+    } else {
+        printf("MPU6050 not responding on I2C1, check wiring and pull-ups\n");
+    }
+
+    if (mpu6050_init() < 0) {
+        printf("MPU6050 init failed\n");
+        for (;;);
+    }
+
+    mpu6050_raw_t imu;
+
+    for (;;) {
+        if (mpu6050_read_all(&imu) == 0) {
+            float ax = mpu6050_accel_g(imu.ax);
+            float ay = mpu6050_accel_g(imu.ay);
+            float az = mpu6050_accel_g(imu.az);
+            printf("Accel: X=%.3fg Y=%.3fg Z=%.3fg\n", ax, ay, az);
+        } else {
+            printf("MPU6050 read failed\n");
         }
+        delay_ms(250);
     }
 }
