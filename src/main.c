@@ -63,8 +63,6 @@ int main(void)
     delay_init();
     serial_stdio_init(115200);
 
-    printf("Starting MPU6050 setup...\n");
-
     RCC->AHB1ENR  |= RCC_AHB1ENR_GPIOBEN;
     GPIOB->MODER  &= ~((3u<<(8*2)) | (3u<<(9*2))); // PB8/PB9 como GPIO output
     GPIOB->MODER  |=  ((1u<<(8*2)) | (1u<<(9*2)));
@@ -79,16 +77,6 @@ int main(void)
     /* PB8=SCL, PB9=SDA on I2C1 */
     i2c1_init_100k(16000000u);
     delay_ms(100);
-
-    uint8_t whoami;
-    if (i2c1_read_reg(0x68, MPU6050_REG_WHOAMI, &whoami) == 0) {
-        printf("Found MPU6050 at 0x68\n");
-    }
-    else if (i2c1_read_reg(0x69, MPU6050_REG_WHOAMI, &whoami) == 0) {
-        printf("Found MPU6050 at 0x69\n");
-    } else {
-        printf("MPU6050 not responding on I2C1, check wiring and pull-ups\n");
-    }
 
     if (mpu6050_init() < 0) {
         printf("MPU6050 init failed\n");
