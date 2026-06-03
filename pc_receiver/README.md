@@ -1,88 +1,108 @@
 # Telemetria da raquete no PC
 
-Este código roda **no computador**, separado do firmware do STM32.
-
-Ele abre a porta serial criada pelo rádio/Bluetooth/USB serial, recebe os dados da raquete e mostra:
+Este código roda no computador. Ele recebe dados pela porta serial criada pelo rádio/USB/Bluetooth e mostra:
 
 - yaw em tempo real;
-- ângulo X / roll;
-- ângulo Y / pitch;
+- roll / ângulo X;
+- pitch / ângulo Y;
 - aceleração X, Y e Z;
-- visualização 3D aproximada da orientação da raquete.
+- heatmap 3x3 dos impactos dos piezos;
+- visualização 3D parecida com uma raquete de ping-pong.
 
-## 1. Instalar dependências
+## Protocolos adotados
 
-No terminal, dentro desta pasta:
-
-```bash
-pip install -r requirements.txt
-```
-
-## 2. Descobrir a porta serial
-
-No Windows:
-
-```bash
-python -m serial.tools.list_ports
-```
-
-Procure algo como `COM3`, `COM4`, `COM5` etc.
-
-No Linux/macOS, normalmente será algo como:
-
-```bash
-/dev/ttyUSB0
-/dev/ttyACM0
-/dev/cu.usbserial-XXXX
-```
-
-## 3. Rodar com a raquete
-
-Exemplo no Windows:
-
-```bash
-python telemetria_raquete.py --port COM5 --baud 115200
-```
-
-Exemplo no Linux:
-
-```bash
-python telemetria_raquete.py --port /dev/ttyUSB0 --baud 115200
-```
-
-Para gravar os dados recebidos em CSV:
-
-```bash
-python telemetria_raquete.py --port COM5 --baud 115200 --csv dados_raquete.csv
-```
-
-## 4. Testar sem a raquete
-
-```bash
-python telemetria_raquete.py --simulate
-```
-
-## Formato recomendado do firmware
-
-O ideal é o STM32 enviar uma linha por amostra:
+### IMU
 
 ```text
-TEL,t_ms,yaw_deg,ang_x_deg,ang_y_deg,acc_x_mg,acc_y_mg,acc_z_mg
+$RAQ,RAQ01,t_ms,yaw_deg,roll_deg,pitch_deg,acc_x_mg,acc_y_mg,acc_z_mg
 ```
 
 Exemplo:
 
 ```text
-TEL,1250,3,12,-4,30,-21,985
+$RAQ,RAQ01,1250,3,12,-4,30,-21,985
 ```
 
-No código atual, `ang_x` é o `roll` e `ang_y` é o `pitch`.
+### Impacto / heatmap
 
-O script também tenta ler o formato antigo, com linhas do tipo:
+Formato curto:
 
 ```text
-Accel : X=   30mg  Y=  -21mg  Z=  985mg
-Roll  :   12deg   Pitch:   -4deg   Yaw:    3deg
+$HIT,RAQ01,t_ms,regiao,valor_pico
 ```
 
-Mas o formato `TEL,...` é mais confiável para rádio serial e para processamento em Python.
+Formato recomendado, com os contadores do heatmap:
+
+```text
+$HIT,RAQ01,t_ms,regiao,valor_pico,h0,h1,h2,h3,h4,h5,h6,h7,h8
+```
+
+Exemplo:
+
+```text
+$HIT,RAQ01,3250,4,1890,0,0,0,0,1,0,0,0,0
+```
+
+Regiões do heatmap:
+
+```text
+0 1 2
+3 4 5
+6 7 8
+```
+
+O Python ignora qualquer outra linha do terminal, incluindo os prints humanos.
+
+## Instalar dependências
+
+```bash
+pip install -r requirements.txt
+```
+
+## Testar sem a raquete
+
+```bash
+python telemetria_raquete.py --mock
+```
+
+ou:
+
+```bash
+python telemetria_raquete.py --simulate
+```
+
+Isso gera dados falsos `$RAQ` e `$HIT` e abre o painel em tempo real.
+
+## Ver linhas falsas no terminal
+
+```bash
+python mock_linhas_raquete.py
+```
+
+## Testar o parser
+
+```bash
+python test_parser.py
+```
+
+## Rodar com a raquete real
+
+Descubra a porta:
+
+```bash
+python -m serial.tools.list_ports
+```
+
+Depois rode, por exemplo:
+
+```bash
+python telemetria_raquete.py --port COM5 --baud 115200
+```
+
+No Linux/macOS, a porta costuma ser algo como `/dev/ttyUSB0`, `/dev/ttyACM0` ou `/dev/cu.usbserial-XXXX`.
+
+## Salvar CSV
+
+```bash
+python telemetria_raquete.py --port COM5 --baud 115200 --csv dados_raquete.csv
+```
