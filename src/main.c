@@ -7,6 +7,7 @@
 #include "../include/stm32f4xx.h"
 #include "delay.h"
 #include "mpu6050.h"
+#define RACKET_ID "RAQ01"
 
 static inline int  uart_rx_ready(void) { return (USART1->SR & USART_SR_RXNE) != 0; }
 static inline char uart_getc(void)     { return (char)USART1->DR; }
@@ -119,12 +120,37 @@ int main(void)
             else if (roll  < -45) tilt = "^^^ ESQUERDA";
             else                  tilt = "PLANO  [===]";
 
-            printf("----------------------------------\r\n");
-            printf("Accel : X=%5dmg  Y=%5dmg  Z=%5dmg\r\n", ax_mg, ay_mg, az_mg);
-            printf("Roll  : %4ddeg   Pitch: %4ddeg   Yaw: %4ddeg\r\n",
-                roll, pitch, yaw_i);
-            printf("Estado: %s\r\n", tilt);
+            printf("IMU | t=%lu ms | yaw=%4d roll=%4d pitch=%4d | acc=[%5d,%5d,%5d] mg | %s\r\n",
+                (unsigned long)millis(),
+                yaw_i,
+                roll,
+                pitch,
+                ax_mg,
+                ay_mg,
+                az_mg,
+                tilt);
 
+            printf("$RAQ,%s,%lu,%d,%d,%d,%d,%d,%d\r\n",
+                RACKET_ID,
+                (unsigned long)millis(),
+                yaw_i,
+                roll,
+                pitch,
+                ax_mg,
+                ay_mg,
+                az_mg);
+
+
+            /*
+            printf("$HIT,%s,%lu,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\r\n",
+                RACKET_ID,
+                (unsigned long)millis(),
+                impact_region,
+                impact_peak,
+                heatmap_hits[0], heatmap_hits[1], heatmap_hits[2],
+                heatmap_hits[3], heatmap_hits[4], heatmap_hits[5],
+                heatmap_hits[6], heatmap_hits[7], heatmap_hits[8]);
+            */
         } else {
             printf("MPU6050 read failed\r\n");
         }
