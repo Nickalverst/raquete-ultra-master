@@ -1,37 +1,28 @@
 """
 Dashboard de telemetria da raquete instrumentada.
+Lê o formato de texto atual do firmware:
 
-Roda no computador, não no STM32.
+    Accel : X=    3mg  Y=    5mg  Z= 1106mg
+    Roll  :    0deg   Pitch:    0deg   Yaw:   65deg
+    Estado: PLANO  [===]
+    ----------------------------------
 
-Recebe dois tipos de mensagem pela serial/radio:
-
-1) IMU/orientação/aceleração:
-$RAQ,RAQ01,t_ms,yaw_deg,roll_deg,pitch_deg,acc_x_mg,acc_y_mg,acc_z_mg
-
-2) Impacto/heatmap dos piezos:
-$HIT,RAQ01,t_ms,regiao,valor_pico,h0,h1,h2,h3,h4,h5,h6,h7,h8
-
-O Python ignora qualquer linha que não comece com $RAQ ou $HIT.
-
-Teste sem raquete:
-python telemetria_raquete.py --mock
-
-Também aceita o alias antigo:
-python telemetria_raquete.py --simulate
+Uso:
+    python telemetria_raquete.py --port COM3
+    python telemetria_raquete.py --port /dev/ttyUSB0
+    python telemetria_raquete.py --mock
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import re
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Deque, Optional, Union
+from typing import Deque, Optional
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
@@ -45,584 +36,377 @@ except ImportError:
     serial = None
 
 
-RAQ_RE = re.compile(
-    r"^\$RAQ\s*,\s*"
-    r"(?P<device>[A-Za-z0-9_-]+)\s*,\s*"
-    r"(?P<t_ms>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<yaw>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<roll>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<pitch>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<ax>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<ay>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<az>-?\d+(?:\.\d+)?)\s*$"
-)
+# ── Regex ──────────────────────────────────────────────────────────────────────
 
-# Aceita os dois formatos:
-# curto:   $HIT,RAQ01,t_ms,regiao,valor_pico
-# completo:$HIT,RAQ01,t_ms,regiao,valor_pico,h0,h1,h2,h3,h4,h5,h6,h7,h8
-HIT_RE = re.compile(
-    r"^\$HIT\s*,\s*"
-    r"(?P<device>[A-Za-z0-9_-]+)\s*,\s*"
-    r"(?P<t_ms>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<region>[0-8])\s*,\s*"
-    r"(?P<peak>-?\d+(?:\.\d+)?)"
-    r"(?P<counts>(?:\s*,\s*-?\d+(?:\.\d+)?){0,9})\s*$"
+ACCEL_RE = re.compile(
+    r"Accel\s*:\s*X=\s*(?P<ax>-?\d+)mg\s+Y=\s*(?P<ay>-?\d+)mg\s+Z=\s*(?P<az>-?\d+)mg"
 )
-
-# Compatibilidade com o formato inicial, caso alguém ainda use TEL.
-OLD_TEL_RE = re.compile(
-    r"^TEL\s*,\s*"
-    r"(?P<t_ms>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<yaw>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<roll>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<pitch>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<ax>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<ay>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<az>-?\d+(?:\.\d+)?)\s*$"
+ANGLE_RE = re.compile(
+    r"Roll\s*:\s*(?P<roll>-?\d+)deg\s+Pitch\s*:\s*(?P<pitch>-?\d+)deg\s+Yaw\s*:\s*(?P<yaw>-?\d+)deg"
 )
+ESTADO_RE = re.compile(r"Estado\s*:\s*(?P<estado>.+)")
+SEP_RE    = re.compile(r"^-{5,}$")
 
+
+# ── Dados ──────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ImuSample:
-    device_id: str
-    t_pc: float
-    t_ms: float
-    yaw_deg: float
-    roll_deg: float
-    pitch_deg: float
-    acc_x_mg: float
-    acc_y_mg: float
-    acc_z_mg: float
+    t_pc:      float = 0.0
+    ax_mg:     Optional[int] = None
+    ay_mg:     Optional[int] = None
+    az_mg:     Optional[int] = None
+    roll_deg:  Optional[int] = None
+    pitch_deg: Optional[int] = None
+    yaw_deg:   Optional[int] = None
+    estado:    str = ""
+
+    def complete(self) -> bool:
+        return None not in (self.ax_mg, self.ay_mg, self.az_mg,
+                            self.roll_deg, self.pitch_deg, self.yaw_deg)
 
 
-@dataclass
-class HitEvent:
-    device_id: str
-    t_pc: float
-    t_ms: float
-    region: int
-    peak_value: float
-    counts: Optional[list[float]] = None
+# ── Parser de blocos ───────────────────────────────────────────────────────────
 
+class BlockParser:
+    def __init__(self) -> None:
+        self._cur = ImuSample()
 
-TelemetryMessage = Union[ImuSample, HitEvent]
-
-
-class TelemetryParser:
-    def __init__(self, expected_id: Optional[str] = "RAQ01", accept_old_tel: bool = True) -> None:
-        self.expected_id = expected_id
-        self.accept_old_tel = accept_old_tel
-
-    def _id_ok(self, device_id: str) -> bool:
-        return (self.expected_id is None) or (device_id == self.expected_id)
-
-    def parse_line(self, line: str) -> Optional[TelemetryMessage]:
+    def feed(self, line: str) -> Optional[ImuSample]:
         line = line.strip()
-        if not line:
+
+        m = ACCEL_RE.search(line)
+        if m:
+            self._cur.ax_mg = int(m.group("ax"))
+            self._cur.ay_mg = int(m.group("ay"))
+            self._cur.az_mg = int(m.group("az"))
+            self._cur.t_pc  = time.time()
             return None
 
-        match = RAQ_RE.match(line)
-        if match:
-            device_id = match.group("device")
-            if not self._id_ok(device_id):
-                return None
-            return ImuSample(
-                device_id=device_id,
-                t_pc=time.time(),
-                t_ms=float(match.group("t_ms")),
-                yaw_deg=float(match.group("yaw")),
-                roll_deg=float(match.group("roll")),
-                pitch_deg=float(match.group("pitch")),
-                acc_x_mg=float(match.group("ax")),
-                acc_y_mg=float(match.group("ay")),
-                acc_z_mg=float(match.group("az")),
-            )
+        m = ANGLE_RE.search(line)
+        if m:
+            self._cur.roll_deg  = int(m.group("roll"))
+            self._cur.pitch_deg = int(m.group("pitch"))
+            self._cur.yaw_deg   = int(m.group("yaw"))
+            return None
 
-        match = HIT_RE.match(line)
-        if match:
-            device_id = match.group("device")
-            if not self._id_ok(device_id):
-                return None
+        m = ESTADO_RE.search(line)
+        if m:
+            self._cur.estado = m.group("estado").strip()
+            return None
 
-            counts_raw = match.group("counts") or ""
-            counts: Optional[list[float]] = None
-            if counts_raw:
-                # Remove a vírgula inicial e converte. Só usa se vierem exatamente 9 campos.
-                parts = [p.strip() for p in counts_raw.split(",") if p.strip()]
-                if len(parts) == 9:
-                    counts = [float(p) for p in parts]
+        if SEP_RE.match(line):
+            if self._cur.complete():
+                sample, self._cur = self._cur, ImuSample()
+                return sample
+            else:
+                self._cur = ImuSample()
 
-            return HitEvent(
-                device_id=device_id,
-                t_pc=time.time(),
-                t_ms=float(match.group("t_ms")),
-                region=int(match.group("region")),
-                peak_value=float(match.group("peak")),
-                counts=counts,
-            )
-
-        if self.accept_old_tel:
-            match = OLD_TEL_RE.match(line)
-            if match:
-                return ImuSample(
-                    device_id="TEL",
-                    t_pc=time.time(),
-                    t_ms=float(match.group("t_ms")),
-                    yaw_deg=float(match.group("yaw")),
-                    roll_deg=float(match.group("roll")),
-                    pitch_deg=float(match.group("pitch")),
-                    acc_x_mg=float(match.group("ax")),
-                    acc_y_mg=float(match.group("ay")),
-                    acc_z_mg=float(match.group("az")),
-                )
-
-        # Qualquer printf humano cai aqui e é ignorado.
         return None
 
 
-class SerialSource:
-    def __init__(self, port: str, baud: int, parser: TelemetryParser) -> None:
-        if serial is None:
-            raise RuntimeError("pyserial não está instalado. Rode: pip install pyserial")
-        self.parser = parser
-        self.ser = serial.Serial(port=port, baudrate=baud, timeout=0.05)
-        self.ser.reset_input_buffer()
-        print(f"Conectado em {port} a {baud} bps. Aguardando mensagens $RAQ/$HIT...")
+# ── Fontes de dados ────────────────────────────────────────────────────────────
 
-    def read_messages(self) -> list[TelemetryMessage]:
-        messages: list[TelemetryMessage] = []
-        start = time.time()
-        while time.time() - start < 0.08:
+class SerialSource:
+    def __init__(self, port: str, baud: int, parser: BlockParser) -> None:
+        if serial is None:
+            raise RuntimeError("pyserial não instalado: pip install pyserial")
+        self.ser    = serial.Serial(port=port, baudrate=baud, timeout=1.0)
+        self.parser = parser
+        self.ser.reset_input_buffer()
+        print(f"[INFO] Conectado em {port} @ {baud} bps")
+
+    def read_samples(self) -> list[ImuSample]:
+        samples = []
+        deadline = time.time() + 0.08
+        while time.time() < deadline:
             raw = self.ser.readline()
             if not raw:
-                break
-            line = raw.decode("utf-8", errors="ignore").strip()
-            message = self.parser.parse_line(line)
-            if message:
-                messages.append(message)
-        return messages
+                continue
+            s = self.parser.feed(raw.decode("utf-8", errors="ignore"))
+            if s:
+                samples.append(s)
+        return samples
 
 
 class MockSource:
-    """Fonte falsa para testar sem raquete e sem rádio."""
+    def __init__(self) -> None:
+        self.t0        = time.time()
+        self.last_sent = -1.0
+        self.parser    = BlockParser()
 
-    def __init__(self, device_id: str = "RAQ01", imu_hz: float = 20.0) -> None:
-        self.device_id = device_id
-        self.imu_period_s = 1.0 / imu_hz
-        self.t0 = time.time()
-        self.last_imu = 0.0
-        self.last_hit_bucket = -1
-        self.parser = TelemetryParser(expected_id=device_id)
-        self.hit_counts = [0] * 9
+    def read_samples(self) -> list[ImuSample]:
+        samples = []
+        now = time.time() - self.t0
+        while self.last_sent + 0.25 <= now:
+            self.last_sent += 0.25
+            t = self.last_sent
+            ax    = int(450 * math.sin(2.1 * t))
+            ay    = int(280 * math.cos(1.6 * t))
+            az    = int(1000 + 100 * math.sin(3.3 * t))
+            roll  = int(28  * math.sin(1.2 * t))
+            pitch = int(22  * math.cos(0.9 * t))
+            yaw   = int(35  * math.sin(0.45 * t))
+            if   pitch >  45: estado = "FRENTE  >>>"
+            elif pitch < -45: estado = "<<< ATRAS"
+            elif roll  >  45: estado = "DIREITA vvv"
+            elif roll  < -45: estado = "^^^ ESQUERDA"
+            else:             estado = "PLANO  [===]"
+            lines = [
+                f"Accel : X={ax:5d}mg  Y={ay:5d}mg  Z={az:5d}mg",
+                f"Roll  : {roll:4d}deg   Pitch: {pitch:4d}deg   Yaw: {yaw:4d}deg",
+                f"Estado: {estado}",
+                "----------------------------------",
+            ]
+            for ln in lines:
+                s = self.parser.feed(ln)
+                if s:
+                    samples.append(s)
+        return samples
 
-    def make_raq_line(self, now: float) -> str:
-        t_ms = int(now * 1000)
 
-        yaw = int(35.0 * math.sin(0.45 * now))
-        roll = int(28.0 * math.sin(1.20 * now))
-        pitch = int(22.0 * math.cos(0.90 * now))
-
-        ax = int(450.0 * math.sin(2.10 * now))
-        ay = int(280.0 * math.cos(1.60 * now))
-        az = int(980.0 + 100.0 * math.sin(3.30 * now))
-
-        # Simula uma batida de vez em quando para dar picos nos gráficos.
-        hit_phase = now % 4.0
-        if 1.15 < hit_phase < 1.30:
-            ax += 900
-            ay -= 500
-            az += 350
-
-        return f"$RAQ,{self.device_id},{t_ms},{yaw},{roll},{pitch},{ax},{ay},{az}"
-
-    def maybe_make_hit_line(self, now: float) -> Optional[str]:
-        # Gera um impacto falso a cada ~2,2 s, mudando a região para preencher o heatmap.
-        bucket = int(now / 2.2)
-        if bucket == self.last_hit_bucket:
-            return None
-        self.last_hit_bucket = bucket
-
-        # Região pseudoaleatória, mas reprodutível e espalhada pela matriz 3x3.
-        region = (bucket * 4 + bucket // 2) % 9
-        peak = int(1300 + 850 * abs(math.sin(1.7 * now)))
-        self.hit_counts[region] += 1
-        t_ms = int(now * 1000)
-        counts = ",".join(str(v) for v in self.hit_counts)
-        return f"$HIT,{self.device_id},{t_ms},{region},{peak},{counts}"
-
-    def read_messages(self) -> list[TelemetryMessage]:
-        messages: list[TelemetryMessage] = []
-        now_abs = time.time()
-        now = now_abs - self.t0
-
-        while self.last_imu + self.imu_period_s <= now:
-            self.last_imu += self.imu_period_s
-            line = self.make_raq_line(self.last_imu)
-            message = self.parser.parse_line(line)
-            if message:
-                messages.append(message)
-
-        hit_line = self.maybe_make_hit_line(now)
-        if hit_line:
-            message = self.parser.parse_line(hit_line)
-            if message:
-                messages.append(message)
-
-        return messages
-
+# ── Geometria 3D ───────────────────────────────────────────────────────────────
 
 def rotation_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
-    """Matriz Rz(yaw) * Ry(pitch) * Rx(roll), ângulos em graus."""
-    r = math.radians(roll_deg)
-    p = math.radians(pitch_deg)
-    y = math.radians(yaw_deg)
+    r, p, y = map(math.radians, (roll_deg, pitch_deg, yaw_deg))
+    Rx = np.array([[1,0,0],[0,math.cos(r),-math.sin(r)],[0,math.sin(r),math.cos(r)]])
+    Ry = np.array([[math.cos(p),0,math.sin(p)],[0,1,0],[-math.sin(p),0,math.cos(p)]])
+    Rz = np.array([[math.cos(y),-math.sin(y),0],[math.sin(y),math.cos(y),0],[0,0,1]])
+    return Rz @ Ry @ Rx
 
-    rx = np.array(
-        [[1, 0, 0], [0, math.cos(r), -math.sin(r)], [0, math.sin(r), math.cos(r)]],
-        dtype=float,
-    )
-    ry = np.array(
-        [[math.cos(p), 0, math.sin(p)], [0, 1, 0], [-math.sin(p), 0, math.cos(p)]],
-        dtype=float,
-    )
-    rz = np.array(
-        [[math.cos(y), -math.sin(y), 0], [math.sin(y), math.cos(y), 0], [0, 0, 1]],
-        dtype=float,
-    )
-    return rz @ ry @ rx
+def transform(pts: np.ndarray, roll: float, pitch: float, yaw: float) -> np.ndarray:
+    return pts @ rotation_matrix(roll, pitch, yaw).T
 
 
-def transform_points(points: np.ndarray, roll: float, pitch: float, yaw: float) -> np.ndarray:
-    R = rotation_matrix(roll, pitch, yaw)
-    return points @ R.T
-
+# ── Dashboard ──────────────────────────────────────────────────────────────────
 
 class Dashboard:
-    def __init__(self, source, csv_path: Optional[Path] = None, window: int = 300) -> None:
-        self.source = source
-        self.samples: Deque[ImuSample] = deque(maxlen=window)
-        self.hit_events: Deque[HitEvent] = deque(maxlen=200)
-        self.heatmap_counts = np.zeros((3, 3), dtype=float)
-        self.last_hit_text = "Nenhum impacto recebido ainda"
+    WINDOW = 200   # amostras no histórico
 
-        self.csv_file = None
-        self.csv_writer = None
-        if csv_path:
-            self.csv_file = csv_path.open("w", newline="", encoding="utf-8")
-            self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(
-                [
-                    "tipo",
-                    "device_id",
-                    "t_ms",
-                    "yaw_deg",
-                    "roll_deg",
-                    "pitch_deg",
-                    "acc_x_mg",
-                    "acc_y_mg",
-                    "acc_z_mg",
-                    "hit_region",
-                    "hit_peak",
-                    "heat_h0",
-                    "heat_h1",
-                    "heat_h2",
-                    "heat_h3",
-                    "heat_h4",
-                    "heat_h5",
-                    "heat_h6",
-                    "heat_h7",
-                    "heat_h8",
-                ]
-            )
+    def __init__(self, source) -> None:
+        self.source  = source
+        self.samples: Deque[ImuSample] = deque(maxlen=self.WINDOW)
 
-        self.fig = plt.figure(figsize=(16, 8))
-        self.fig.suptitle("Raquete instrumentada - telemetria + heatmap")
-        gs = gridspec.GridSpec(3, 4, figure=self.fig, width_ratios=[1.1, 1.1, 0.9, 1.2])
+        # ── figura ──────────────────────────────────────────────────────────
+        self.fig = plt.figure(figsize=(16, 8), facecolor="#0e1117")
+        self.fig.suptitle("Raquete instrumentada — telemetria IMU",
+                          color="#e8eaf0", fontsize=13, fontweight="bold", y=0.98)
 
-        labels = [
-            "Yaw (°)",
-            "Roll / Ângulo X (°)",
-            "Pitch / Ângulo Y (°)",
-            "Aceleração X (mg)",
-            "Aceleração Y (mg)",
-            "Aceleração Z (mg)",
-        ]
+        gs = gridspec.GridSpec(3, 3, figure=self.fig,
+                               width_ratios=[1.1, 1.1, 1.2],
+                               hspace=0.55, wspace=0.35)
 
-        positions = [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
-        self.axes = []
-        self.lines = []
-        for label, (row, col) in zip(labels, positions):
+        ax_cfg = dict(facecolor="#161b22",
+                      tick_params=dict(colors="#6e7681", labelsize=8),
+                      spine_color="#30363d")
+
+        def make_ax(row, col, title, color):
             ax = self.fig.add_subplot(gs[row, col])
-            ax.set_title(label)
-            ax.grid(True, alpha=0.3)
-            line, = ax.plot([], [], linewidth=1.5)
-            self.axes.append(ax)
-            self.lines.append(line)
+            ax.set_facecolor(ax_cfg["facecolor"])
+            ax.set_title(title, color=color, fontsize=9, pad=4)
+            ax.tick_params(colors=ax_cfg["tick_params"]["colors"],
+                           labelsize=ax_cfg["tick_params"]["labelsize"])
+            for sp in ax.spines.values():
+                sp.set_edgecolor(ax_cfg["spine_color"])
+            ax.grid(True, color="#21262d", linewidth=0.5, linestyle="--")
+            line, = ax.plot([], [], color=color, linewidth=1.4)
+            return ax, line
 
-        self.ax_heat = self.fig.add_subplot(gs[0:2, 2])
-        self.ax_heat.set_title("Heatmap dos piezos")
-        self.heat_img = self.ax_heat.imshow(self.heatmap_counts, vmin=0, vmax=1, origin="upper")
-        self.ax_heat.set_xticks([0, 1, 2])
-        self.ax_heat.set_yticks([0, 1, 2])
-        self.ax_heat.set_xticklabels(["0", "1", "2"])
-        self.ax_heat.set_yticklabels(["0", "1", "2"])
-        self.heat_texts = []
-        for r in range(3):
-            row_texts = []
-            for c in range(3):
-                txt = self.ax_heat.text(c, r, "0", ha="center", va="center")
-                row_texts.append(txt)
-            self.heat_texts.append(row_texts)
+        angle_color = "#58a6ff"
+        acc_color   = "#f78166"
 
-        self.ax_hit_info = self.fig.add_subplot(gs[2, 2])
-        self.ax_hit_info.axis("off")
-        self.hit_info_artist = self.ax_hit_info.text(0.0, 0.75, self.last_hit_text, va="top")
+        self.ax_yaw,   self.ln_yaw   = make_ax(0, 0, "Yaw (°)",           angle_color)
+        self.ax_roll,  self.ln_roll  = make_ax(0, 1, "Roll (°)",           angle_color)
+        self.ax_pitch, self.ln_pitch = make_ax(1, 0, "Pitch (°)",          angle_color)
+        self.ax_ax,    self.ln_ax    = make_ax(1, 1, "Aceleração X (mg)",  acc_color)
+        self.ax_ay,    self.ln_ay    = make_ax(2, 0, "Aceleração Y (mg)",  acc_color)
+        self.ax_az,    self.ln_az    = make_ax(2, 1, "Aceleração Z (mg)",  acc_color)
 
-        self.ax3d = self.fig.add_subplot(gs[:, 3], projection="3d")
-        self.ax3d.set_title("Orientação 3D - raquete")
+        self.all_axes  = [self.ax_yaw, self.ax_roll, self.ax_pitch,
+                          self.ax_ax,  self.ax_ay,   self.ax_az]
+        self.all_lines = [self.ln_yaw, self.ln_roll, self.ln_pitch,
+                          self.ln_ax,  self.ln_ay,   self.ln_az]
 
-        plt.tight_layout()
+        # ── painel de estado (centro-baixo) ─────────────────────────────────
+        self.ax_status = self.fig.add_subplot(gs[2, 1])
+        self.ax_status.set_facecolor("#161b22")
+        self.ax_status.axis("off")
+        for sp in self.ax_status.spines.values():
+            sp.set_edgecolor("#30363d")
+        self.txt_status = self.ax_status.text(
+            0.5, 0.55, "Aguardando dados...",
+            ha="center", va="center", fontsize=14, fontweight="bold",
+            color="#e8eaf0", transform=self.ax_status.transAxes)
+        self.txt_vals = self.ax_status.text(
+            0.5, 0.15, "",
+            ha="center", va="center", fontsize=8,
+            color="#8b949e", transform=self.ax_status.transAxes,
+            fontfamily="monospace")
 
-    def add_message(self, message: TelemetryMessage) -> None:
-        if isinstance(message, ImuSample):
-            self.samples.append(message)
-            if self.csv_writer:
-                self.csv_writer.writerow(
-                    [
-                        "RAQ",
-                        message.device_id,
-                        message.t_ms,
-                        message.yaw_deg,
-                        message.roll_deg,
-                        message.pitch_deg,
-                        message.acc_x_mg,
-                        message.acc_y_mg,
-                        message.acc_z_mg,
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                    ]
-                )
-            return
+        # ── 3D ──────────────────────────────────────────────────────────────
+        self.ax3d = self.fig.add_subplot(gs[:, 2], projection="3d")
+        self.ax3d.set_facecolor("#0e1117")
+        self.ax3d.set_title("Orientação 3D", color="#e8eaf0", fontsize=9, pad=6)
 
-        if isinstance(message, HitEvent):
-            self.hit_events.append(message)
-            if message.counts and len(message.counts) == 9:
-                self.heatmap_counts = np.array(message.counts, dtype=float).reshape(3, 3)
-            else:
-                row = message.region // 3
-                col = message.region % 3
-                self.heatmap_counts[row, col] += 1
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
 
-            self.last_hit_text = (
-                f"Último impacto\n"
-                f"ID: {message.device_id}\n"
-                f"t = {message.t_ms:.0f} ms\n"
-                f"região = {message.region}\n"
-                f"pico = {message.peak_value:.0f}"
-            )
-
-            if self.csv_writer:
-                flat = self.heatmap_counts.reshape(-1).tolist()
-                self.csv_writer.writerow(
-                    [
-                        "HIT",
-                        message.device_id,
-                        message.t_ms,
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        message.region,
-                        message.peak_value,
-                        *flat,
-                    ]
-                )
+    # ── atualização ───────────────────────────────────────────────────────────
 
     def update(self, _frame):
-        for message in self.source.read_messages():
-            self.add_message(message)
+        for s in self.source.read_samples():
+            self.samples.append(s)
 
         if self.samples:
-            self.update_graphs()
-            self.update_3d(self.samples[-1])
+            self._update_graphs()
+            self._update_status(self.samples[-1])
+            self._update_3d(self.samples[-1])
         else:
-            self.update_3d(None)
+            self._update_3d(None)
 
-        self.update_heatmap()
-        return self.lines
+        return self.all_lines
 
-    def update_graphs(self) -> None:
+    def _update_graphs(self) -> None:
         data = list(self.samples)
-        t = np.array([(s.t_ms - data[0].t_ms) / 1000.0 for s in data])
-        values = [
-            [s.yaw_deg for s in data],
-            [s.roll_deg for s in data],
+        t0   = data[0].t_pc
+        t    = np.array([(s.t_pc - t0) for s in data])
+
+        series = [
+            [s.yaw_deg   for s in data],
+            [s.roll_deg  for s in data],
             [s.pitch_deg for s in data],
-            [s.acc_x_mg for s in data],
-            [s.acc_y_mg for s in data],
-            [s.acc_z_mg for s in data],
+            [s.ax_mg     for s in data],
+            [s.ay_mg     for s in data],
+            [s.az_mg     for s in data],
         ]
 
-        for ax, line, y in zip(self.axes, self.lines, values):
+        t_end  = t[-1]
+        t_from = max(0.0, t_end - 15.0)
+
+        for ax, line, y in zip(self.all_axes, self.all_lines, series):
             line.set_data(t, y)
             ax.relim()
             ax.autoscale_view()
-            ax.set_xlim(max(0, t[-1] - 15), max(15, t[-1] + 0.5))
+            ax.set_xlim(t_from, max(15.0, t_end + 0.5))
 
-    def update_heatmap(self) -> None:
-        max_count = max(1.0, float(np.max(self.heatmap_counts)))
-        self.heat_img.set_data(self.heatmap_counts)
-        self.heat_img.set_clim(vmin=0, vmax=max_count)
+    def _update_status(self, s: ImuSample) -> None:
+        estado_map = {
+            "FRENTE":   ("FRENTE  >>>",  "#f0883e"),
+            "ATRAS":    ("<<< ATRÁS",    "#f0883e"),
+            "DIREITA":  ("DIREITA  ↓",   "#58a6ff"),
+            "ESQUERDA": ("↑  ESQUERDA",  "#58a6ff"),
+            "PLANO":    ("PLANO  ═══",   "#3fb950"),
+        }
+        cor   = "#e8eaf0"
+        texto = s.estado
+        for key, (label, c) in estado_map.items():
+            if key in s.estado.upper():
+                texto, cor = label, c
+                break
 
-        for r in range(3):
-            for c in range(3):
-                value = int(self.heatmap_counts[r, c])
-                self.heat_texts[r][c].set_text(str(value))
+        self.txt_status.set_text(texto)
+        self.txt_status.set_color(cor)
+        self.txt_vals.set_text(
+            f"yaw {s.yaw_deg:+4d}°   roll {s.roll_deg:+4d}°   pitch {s.pitch_deg:+4d}°\n"
+            f"ax {s.ax_mg:+5d} mg   ay {s.ay_mg:+5d} mg   az {s.az_mg:+5d} mg"
+        )
 
-        self.hit_info_artist.set_text(self.last_hit_text)
+    def _update_3d(self, s: Optional[ImuSample]) -> None:
+        ax = self.ax3d
+        ax.cla()
+        ax.set_facecolor("#0e1117")
+        ax.set_title("Orientação 3D", color="#e8eaf0", fontsize=9, pad=6)
+        ax.set_xlim(-1.2, 1.2); ax.set_ylim(-1.2, 1.2); ax.set_zlim(-1.2, 1.2)
+        ax.set_xlabel("X", color="#6e7681", fontsize=8)
+        ax.set_ylabel("Y", color="#6e7681", fontsize=8)
+        ax.set_zlabel("Z", color="#6e7681", fontsize=8)
+        ax.tick_params(colors="#6e7681", labelsize=7)
+        for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
+            pane.fill = False
+            pane.set_edgecolor("#21262d")
 
-    def update_3d(self, sample: Optional[ImuSample]) -> None:
-        self.ax3d.cla()
-        self.ax3d.set_title("Orientação 3D - raquete de ping-pong")
-        self.ax3d.set_xlim(-1.2, 1.2)
-        self.ax3d.set_ylim(-1.2, 1.2)
-        self.ax3d.set_zlim(-1.2, 1.2)
-        self.ax3d.set_xlabel("X")
-        self.ax3d.set_ylabel("Y")
-        self.ax3d.set_zlabel("Z")
+        roll  = s.roll_deg  if s else 0.0
+        pitch = s.pitch_deg if s else 0.0
+        yaw   = s.yaw_deg   if s else 0.0
 
-        if sample is None:
-            roll = pitch = yaw = 0.0
-            device_id = "sem dados"
-        else:
-            roll = sample.roll_deg
-            pitch = sample.pitch_deg
-            yaw = sample.yaw_deg
-            device_id = sample.device_id
-
-        # Face circular da raquete de ping-pong no plano XY local.
-        theta = np.linspace(0, 2 * math.pi, 64)
+        # Face circular da raquete
+        theta  = np.linspace(0, 2 * math.pi, 64)
         radius = 0.42
-        center_y = 0.28
-        circle = np.column_stack(
-            [
-                radius * np.cos(theta),
-                center_y + radius * np.sin(theta),
-                np.zeros_like(theta),
-            ]
-        )
+        cy     = 0.28
+        circle = np.column_stack([radius * np.cos(theta),
+                                  cy + radius * np.sin(theta),
+                                  np.zeros_like(theta)])
+        handle = np.array([[-0.10, -1.00, 0.0], [ 0.10, -1.00, 0.0],
+                           [ 0.13, -0.05, 0.0], [-0.13, -0.05, 0.0]])
+        dz = 0.035
 
-        # Cabo da raquete, também no plano XY local.
-        handle = np.array(
-            [
-                [-0.10, -1.00, 0.0],
-                [0.10, -1.00, 0.0],
-                [0.13, -0.05, 0.0],
-                [-0.13, -0.05, 0.0],
-            ],
-            dtype=float,
-        )
+        cf = transform(circle + [0, 0,  dz], roll, pitch, yaw)
+        cb = transform(circle + [0, 0, -dz], roll, pitch, yaw)
+        hf = transform(handle + [0, 0,  dz], roll, pitch, yaw)
+        hb = transform(handle + [0, 0, -dz], roll, pitch, yaw)
 
-        # Pequena espessura visual.
-        z_offset = 0.035
-        circle_front = transform_points(circle + np.array([0, 0, z_offset]), roll, pitch, yaw)
-        circle_back = transform_points(circle - np.array([0, 0, z_offset]), roll, pitch, yaw)
-        handle_front = transform_points(handle + np.array([0, 0, z_offset]), roll, pitch, yaw)
-        handle_back = transform_points(handle - np.array([0, 0, z_offset]), roll, pitch, yaw)
+        ax.add_collection3d(Poly3DCollection([cf], alpha=0.55,
+                            facecolor="#238636", edgecolor="#3fb950"))
+        ax.add_collection3d(Poly3DCollection([cb], alpha=0.20,
+                            facecolor="#238636", edgecolor="none"))
+        ax.add_collection3d(Poly3DCollection([hf], alpha=0.65,
+                            facecolor="#6e4c1e", edgecolor="#9e6b2e"))
+        ax.add_collection3d(Poly3DCollection([hb], alpha=0.25,
+                            facecolor="#6e4c1e", edgecolor="none"))
 
-        self.ax3d.add_collection3d(Poly3DCollection([circle_front], alpha=0.45))
-        self.ax3d.add_collection3d(Poly3DCollection([circle_back], alpha=0.20))
-        self.ax3d.add_collection3d(Poly3DCollection([handle_front], alpha=0.55))
-        self.ax3d.add_collection3d(Poly3DCollection([handle_back], alpha=0.25))
+        ax.plot(cf[:, 0], cf[:, 1], cf[:, 2], color="#3fb950", linewidth=1.2)
+        ch = np.vstack([hf, hf[0]])
+        ax.plot(ch[:, 0], ch[:, 1], ch[:, 2], color="#9e6b2e", linewidth=1.2)
 
-        # Contorno da face e do cabo para ficar mais reconhecível.
-        self.ax3d.plot(circle_front[:, 0], circle_front[:, 1], circle_front[:, 2], linewidth=1.5)
-        closed_handle = np.vstack([handle_front, handle_front[0]])
-        self.ax3d.plot(closed_handle[:, 0], closed_handle[:, 1], closed_handle[:, 2], linewidth=1.5)
-
-        # Linhas 3x3 sobre a face, alinhadas com a ideia dos 9 piezos.
+        # Grid 3x3 sobre a face
         for x in [-radius / 3, radius / 3]:
-            line = np.array([[x, center_y - radius, z_offset * 1.3], [x, center_y + radius, z_offset * 1.3]])
-            rot = transform_points(line, roll, pitch, yaw)
-            self.ax3d.plot(rot[:, 0], rot[:, 1], rot[:, 2], linewidth=0.8)
-        for yline in [center_y - radius / 3, center_y + radius / 3]:
-            line = np.array([[-radius, yline, z_offset * 1.3], [radius, yline, z_offset * 1.3]])
-            rot = transform_points(line, roll, pitch, yaw)
-            self.ax3d.plot(rot[:, 0], rot[:, 1], rot[:, 2], linewidth=0.8)
+            ln = np.array([[x, cy - radius, dz * 1.5], [x, cy + radius, dz * 1.5]])
+            r  = transform(ln, roll, pitch, yaw)
+            ax.plot(r[:, 0], r[:, 1], r[:, 2], color="#58a6ff", linewidth=0.6, alpha=0.6)
+        for yl in [cy - radius / 3, cy + radius / 3]:
+            ln = np.array([[-radius, yl, dz * 1.5], [radius, yl, dz * 1.5]])
+            r  = transform(ln, roll, pitch, yaw)
+            ax.plot(r[:, 0], r[:, 1], r[:, 2], color="#58a6ff", linewidth=0.6, alpha=0.6)
 
-        # Eixos locais da raquete.
-        origin = np.array([0.0, 0.0, 0.0])
+        # Eixos locais
         R = rotation_matrix(roll, pitch, yaw)
-        local_axes = np.eye(3) @ R.T
-        self.ax3d.quiver(*origin, *local_axes[0], length=0.55, normalize=True)
-        self.ax3d.quiver(*origin, *local_axes[1], length=0.55, normalize=True)
-        self.ax3d.quiver(*origin, *local_axes[2], length=0.55, normalize=True)
+        origin = np.zeros(3)
+        colors_ax = ["#f78166", "#3fb950", "#58a6ff"]
+        for i, c in enumerate(colors_ax):
+            v = R[i] * 0.6
+            ax.quiver(*origin, *v, color=c, linewidth=1.2, arrow_length_ratio=0.2)
 
-        self.ax3d.text2D(
-            0.02,
-            0.02,
-            f"{device_id}\nyaw={yaw:.0f}°  roll={roll:.0f}°  pitch={pitch:.0f}°",
-            transform=self.ax3d.transAxes,
-        )
+        label = "sem dados" if s is None else f"yaw={yaw:.0f}°  roll={roll:.0f}°  pitch={pitch:.0f}°"
+        ax.text2D(0.02, 0.02, label, transform=ax.transAxes,
+                  color="#8b949e", fontsize=7)
+
+    # ── loop principal ────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        # IMPORTANTE:
-        # O objeto da animação precisa ficar guardado em uma variável viva.
-        # Se criarmos FuncAnimation sem salvar a referência, o Python pode apagar
-        # a animação da memória e a janela abre sem atualizar os dados.
         self.anim = animation.FuncAnimation(
-            self.fig,
-            self.update,
-            interval=50,
-            blit=False,
-            cache_frame_data=False,
-        )
+            self.fig, self.update,
+            interval=80, blit=False, cache_frame_data=False)
+        plt.show()
 
-        try:
-            plt.show()
-        finally:
-            if self.csv_file:
-                self.csv_file.close()
 
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Recebedor de telemetria da raquete instrumentada")
-    parser.add_argument("--port", help="Porta serial. Ex.: COM5 ou /dev/ttyUSB0")
-    parser.add_argument("--baud", type=int, default=115200, help="Baud rate da serial")
-    parser.add_argument("--id", default="RAQ01", help="ID esperado da raquete. Use --id '' para aceitar qualquer ID")
-    parser.add_argument(
-        "--mock",
-        "--simulate",
-        dest="mock",
-        action="store_true",
-        help="Usa dados falsos, sem raquete e sem rádio",
-    )
-    parser.add_argument("--csv", type=Path, help="Salva as amostras e impactos recebidos em CSV")
-    args = parser.parse_args()
-
-    expected_id = args.id if args.id else None
+    ap = argparse.ArgumentParser(description="Dashboard telemetria raquete")
+    ap.add_argument("--port", help="Ex.: COM3 ou /dev/ttyUSB0")
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--mock", action="store_true", help="Dados falsos sem hardware")
+    args = ap.parse_args()
 
     if args.mock:
-        source = MockSource(device_id=expected_id or "RAQ01")
-        print("Modo mock ligado: gerando $RAQ e $HIT falsos.")
+        print("[INFO] Modo mock ativo\n")
+        source = MockSource()
+    elif args.port:
+        source = SerialSource(args.port, args.baud, BlockParser())
     else:
-        if not args.port:
-            print("Erro: informe --port COMx ou use --mock para testar sem raquete.", file=sys.stderr)
-            return 2
-        source = SerialSource(args.port, args.baud, TelemetryParser(expected_id=expected_id))
+        print("Erro: passe --port COMx ou use --mock", file=sys.stderr)
+        return 2
 
-    Dashboard(source, csv_path=args.csv).run()
+    Dashboard(source).run()
     return 0
 
 
