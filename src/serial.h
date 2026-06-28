@@ -16,4 +16,4 @@ int      serial_getc_blocking(void); /* lê 1 byte (bloqueante) */
 /* ---- Retarget de stdio (printf) ----
    Configura USART1 e ajusta stdout para sem buffer.
    Depois disso: printf("oi\r\n"); já imprime na serial. */
-//void serial_stdio_init(uint32_t baud);
+void serial_stdio_init(uint32_t baud);

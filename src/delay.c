@@ -5,9 +5,9 @@
 static volatile uint32_t g_ms = 0;
 
 /* IRQ do SysTick: incrementa 1 ms */
-void SysTick_Handler(void){
-    g_ms++;
-}
+// void SysTick_Handler(void){
+//     g_ms++;
+// }
 
 /* Configura SysTick para 1 kHz usando o clock atual da CPU. */
 void delay_init(void){

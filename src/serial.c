@@ -13,12 +13,27 @@ static inline int uart1_txc_done_ll(void) {
     return (USART1->SR & USART_SR_TC) != 0;
 }
 
-/* Calcula BRR para OVER8=0 (oversampling 16).
-   Usa SystemCoreClock como clock de APB2 quando o prescaler for 1
-   (caso mude o clock, chame SystemCoreClockUpdate()) */
-static uint32_t usart1_brr_from_clk(uint32_t pclk, uint32_t baud){
-    /* BRR = pclk / baud (formato mantissa.frac4), com arredondamento */
-    uint32_t div16 = (pclk + (baud/2u)) / baud; // arredonda
+/* ================= Clock helpers ================= */
+static inline uint32_t _ahb_div(uint32_t hpre){
+    static const uint16_t map[16] = {1,1,1,1,1,1,1,1, 2,4,8,16,64,128,256,512};
+    return map[hpre & 0xF];
+}
+static inline uint32_t _apb_div(uint32_t ppre){
+    static const uint8_t map[8] = {1,1,1,1, 2,4,8,16};
+    return map[ppre & 0x7];
+}
+static inline uint32_t _pclk2_hz(void){
+    SystemCoreClockUpdate();
+    uint32_t cfgr  = RCC->CFGR;
+    uint32_t hpre  = (cfgr >> 4)  & 0xF;   // AHB prescaler bits
+    uint32_t ppre2 = (cfgr >> 13) & 0x7;   // APB2 prescaler bits
+    uint32_t hclk  = SystemCoreClock / _ahb_div(hpre);
+    return hclk / _apb_div(ppre2);         // PCLK2 real (para USART1)
+}
+
+/* Calcula BRR para OVER8=0 (oversampling 16) */
+static inline uint32_t usart1_brr_from_clk(uint32_t pclk, uint32_t baud){
+    uint32_t div16 = (pclk + (baud/2u)) / baud;
     uint32_t mant  = div16 / 16u;
     uint32_t frac  = div16 % 16u;
     return (mant << 4) | (frac & 0xFu);
@@ -43,13 +58,17 @@ void serial_init(uint32_t baud){
     USART1->CR2 = 0u;
     USART1->CR3 = 0u;
 
-    /* BRR: considere APB2 = SystemCoreClock quando prescaler=1 */
-    uint32_t pclk2 = SystemCoreClock;  /* se usar prescaler em APB2, ajuste aqui */
+    /* BRR: calcula automaticamente o clock real de APB2 */
+    uint32_t pclk2 = _pclk2_hz();
+    USART1->CR1 &= ~USART_CR1_OVER8;    // oversampling 16
     USART1->BRR = usart1_brr_from_clk(pclk2, baud);
 
     /* Habilita TX/RX + USART */
     USART1->CR1 |= USART_CR1_TE | USART_CR1_RE;
     USART1->CR1 |= USART_CR1_UE;
+
+    /* pequeno atraso para estabilizar antes do primeiro envio */
+    for (volatile uint32_t i = 0; i < 30000; ++i) __NOP();
 }
 
 void serial_write(const char *s){
@@ -69,22 +88,18 @@ int  serial_getc_blocking(void){
     return (int)(USART1->DR & 0xFF);
 }
 
-/* ================= Retarget de stdio =================
-   Depois de chamar serial_stdio_init(baud),
-   printf()/puts()/putchar() usam esta UART. */
+/* ================= Retarget de stdio ================= */
 void serial_stdio_init(uint32_t baud){
     serial_init(baud);
-    /* stdout sem buffer: imprime na hora */
     setvbuf(stdout, NULL, _IONBF, 0);
 }
 
-/* ---- syscall _write: usado por printf/puts/putchar ---- */
 int _write(int fd, const void *buf, size_t count) {
-    (void)fd; /* stdout/stderr */
+    (void)fd;
     const uint8_t *p = (const uint8_t*)buf;
     for (size_t i = 0; i < count; i++) {
         uint8_t c = p[i];
-        if (c == '\n') uart1_putc_ll('\r'); /* CRLF */
+        if (c == '\n') uart1_putc_ll('\r');
         uart1_putc_ll(c);
     }
     while (!uart1_txc_done_ll()) {}
@@ -96,7 +111,7 @@ __attribute__((weak)) int _read(int fd, void *buf, size_t count) {
     (void)fd; (void)buf; (void)count; return 0;
 }
 __attribute__((weak)) caddr_t _sbrk(int incr) {
-    extern uint8_t _end;     /* símbolo do linker */
+    extern uint8_t _end;
     static uint8_t *heap_end;
     uint8_t *prev;
     if (heap_end == 0) heap_end = &_end;
