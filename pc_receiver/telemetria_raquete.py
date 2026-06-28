@@ -105,6 +105,67 @@ class HitSample:
 Sample = Union[ImuSample, HitSample]
 
 
+# ── filtros de sinal ───────────────────────────────────────────────────────────
+
+class _SpikeFilter:
+    """
+    Rejects lone spikes by comparing each incoming value against a rolling
+    median.  If the deviation exceeds `threshold` × rolling σ the sample is
+    replaced with the previous accepted value, keeping the display stable.
+
+    window=15 @ 20 Hz ≈ 750 ms of history — enough to judge a single-sample
+    spike without lagging legitimate fast movements.
+    """
+    def __init__(self, window: int = 20, threshold: float = 8.0) -> None:
+        self._buf       = deque(maxlen=window)
+        self._threshold = threshold
+        self._prev: Optional[int] = None
+
+    def feed(self, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if len(self._buf) < 4:          # prime the buffer without filtering
+            self._buf.append(v)
+            self._prev = v
+            return v
+        med = float(np.median(self._buf))
+        # Floor std at 1.0 so a perfectly-constant signal still rejects spikes
+        std = max(float(np.std(self._buf)), 1.0)
+        if abs(v - med) > self._threshold * std:
+            return self._prev           # spike — repeat last clean value
+        self._buf.append(v)
+        self._prev = v
+        return v
+
+
+class _YawHighPass:
+    """
+    First-order high-pass filter to remove slow gyroscope drift from the yaw
+    display without attenuating genuine fast yaw movements.
+
+        y[n] = α × (y[n-1] + x[n] − x[n-1])
+
+    α = 0.97 @ 20 Hz → time constant ≈ 1.7 s.  Changes slower than that
+    (i.e. typical gyro bias drift) are attenuated to zero; actual strokes
+    that happen in < 500 ms pass through unaffected.
+    """
+    _ALPHA = 0.97 # The lower, the less sensitive
+
+    def __init__(self) -> None:
+        self._prev_raw: Optional[int] = None
+        self._out = 0.0
+
+    def feed(self, raw: Optional[int]) -> Optional[int]:
+        if raw is None:
+            return None
+        if self._prev_raw is None:      # first sample — output zero
+            self._prev_raw = raw
+            return 0
+        self._out      = self._ALPHA * (self._out + raw - self._prev_raw)
+        self._prev_raw = raw
+        return int(round(self._out))
+
+
 # ── fontes de dados ────────────────────────────────────────────────────────────
 
 class SerialSource:
@@ -216,6 +277,11 @@ class Dashboard(QMainWindow):
         self.source   = source
         self.samples: Deque[ImuSample] = deque(maxlen=self.WINDOW)
         self._heatmap = [0] * 9
+
+        # ── per-channel signal filters ───────────────────────────────────
+        _imu_fields = ("yaw_deg", "roll_deg", "pitch_deg", "ax_mg", "ay_mg", "az_mg")
+        self._spike  = {f: _SpikeFilter() for f in _imu_fields}
+        self._yaw_hp = _YawHighPass()
 
         self.setWindowTitle("Raquete instrumentada — telemetria IMU")
         self.resize(1440, 820)
@@ -436,6 +502,12 @@ class Dashboard(QMainWindow):
     def _tick(self) -> None:
         for s in self.source.read_samples():
             if isinstance(s, ImuSample):
+                # 1. Spike rejection on every channel
+                for attr in ("yaw_deg", "roll_deg", "pitch_deg",
+                             "ax_mg", "ay_mg", "az_mg"):
+                    setattr(s, attr, self._spike[attr].feed(getattr(s, attr)))
+                # 2. High-pass yaw drift removal (applied after spike filter)
+                s.yaw_deg = self._yaw_hp.feed(s.yaw_deg)
                 self.samples.append(s)
             elif isinstance(s, HitSample):
                 self._heatmap = s.heatmap[:]
@@ -471,6 +543,9 @@ class Dashboard(QMainWindow):
             "Aceleracao X (mg)": "ax_mg",
             "Aceleracao Y (mg)": "ay_mg",
         }
+        _ACCEL = {"Aceleracao X (mg)", "Aceleracao Y (mg)"}
+        _ANGLE = {"Yaw (graus)", "Roll (graus)", "Pitch (graus)"}
+
         for title, attr in attrs.items():
             y = np.fromiter(
                 (getattr(s, attr) or 0 for s in data),
@@ -478,11 +553,24 @@ class Dashboard(QMainWindow):
             self._curves[title].setData(t_arr, y)
             self._plots[title].setXRange(
                 t_from, max(20.0, t_end + 0.5), padding=0)
+            if title in _ACCEL:
+                # Enforce ±1500 mg floor; expand if real data exceeds it
+                self._plots[title].setYRange(
+                    min(-1500.0, float(y.min())),
+                    max( 1500.0, float(y.max())),
+                    padding=0.05)
+            elif title in _ANGLE:
+                self._plots[title].setYRange(
+                    min(-45.0, float(y.min())),
+                    max( 45.0, float(y.max())),
+                    padding=0.05)
 
     def _update_heatmap(self) -> None:
         data = np.array(self._heatmap, dtype=np.float32).reshape(3, 3)
         mx   = float(data.max())
-        self._hm_img.setImage(data)
+        # PyQtGraph ImageItem indexes [x, y] = [col, row]; our array is
+        # [row, col], so transpose before passing to align colours with labels.
+        self._hm_img.setImage(np.ascontiguousarray(data.T))
         self._hm_img.setLevels((0.0, max(mx, 1.0)))
         for idx, txt in enumerate(self._hm_texts):
             txt.setText(str(self._heatmap[idx]))
