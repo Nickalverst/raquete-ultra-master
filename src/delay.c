@@ -1,31 +1,42 @@
 #include "stm32f4xx.h"
 #include "delay.h"
 
-/* contador de milissegundos (incrementado no SysTick) */
-static volatile uint32_t g_ms = 0;
+/*
+ * delay.c — implementação via DWT (Data Watchpoint & Trace)
+ *
+ * NÃO usa SysTick, portanto não conflita com o FreeRTOS,
+ * que precisa do SysTick exclusivamente para o seu tick.
+ *
+ * delay_ms() funciona tanto antes quanto depois do scheduler iniciar.
+ * Dentro de tasks, prefira vTaskDelay() para não desperdiçar CPU.
+ *
+ * millis() retorna ms desde boot usando o contador DWT.
+ * Dentro de tasks, prefira xTaskGetTickCount() (que é o tick do RTOS).
+ */
 
-/* IRQ do SysTick: incrementa 1 ms */
-// void SysTick_Handler(void){
-//     g_ms++;
-// }
-
-/* Configura SysTick para 1 kHz usando o clock atual da CPU. */
-void delay_init(void){
-    SystemCoreClockUpdate();                             
-    SysTick->LOAD = (SystemCoreClock / 1000u) - 1u;         /* 1 ms */
-    SysTick->VAL  = 0u;
-    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk              /* usa clock da CPU */
-                  | SysTick_CTRL_TICKINT_Msk                /* habilita IRQ */
-                  | SysTick_CTRL_ENABLE_Msk;                /* liga SysTick */
+void delay_init(void)
+{
+    /* Habilita o bloco DWT */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    /* Zera e liga o contador de ciclos */
+    DWT->CYCCNT = 0u;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
-void delay_ms(uint32_t ms){
-    uint32_t start = g_ms;
-    while ((g_ms - start) < ms){
-        __NOP();                                            
+void delay_ms(uint32_t ms)
+{
+    uint32_t cycles_per_ms = SystemCoreClock / 1000u;
+    while (ms--)
+    {
+        uint32_t start = DWT->CYCCNT;
+        while ((DWT->CYCCNT - start) < cycles_per_ms)
+        {
+            __NOP();
+        }
     }
 }
 
-uint32_t millis(void){
-    return g_ms;
+uint32_t millis(void)
+{
+    return DWT->CYCCNT / (SystemCoreClock / 1000u);
 }
