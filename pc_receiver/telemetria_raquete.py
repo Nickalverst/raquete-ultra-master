@@ -1,5 +1,5 @@
 """
-Dashboard de telemetria da raquete instrumentada.
+Dashboard de telemetria da raquete instrumentada — PyQtGraph edition.
 Protocolo: FlatBuffers binário via racket_fb.py
 
 Wire format:
@@ -9,7 +9,7 @@ Wire format:
 
 Uso:
     python telemetria_raquete.py --port COM3
-    python telemetria_raquete.py --port /dev/ttyUSB0
+    python telemetria_raquete.py --port /dev/ttyUSB0 --baud 115200
     python telemetria_raquete.py --mock
 """
 
@@ -24,62 +24,93 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Union
 
-import matplotlib.animation as animation
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import gridspec
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import pyqtgraph as pg
+from pyqtgraph.Qt.QtCore import Qt, QTimer
+from pyqtgraph.Qt.QtGui import QFont
+from pyqtgraph.Qt.QtWidgets import (
+    QApplication, QHBoxLayout, QLabel,
+    QMainWindow, QVBoxLayout, QWidget,
+)
+
+try:
+    import pyqtgraph.opengl as gl
+    _GL = True
+except ImportError:
+    _GL = False
+    print("[WARN] PyOpenGL não encontrado — view 3D desativada.\n"
+          "       pip install PyOpenGL PyOpenGL_accelerate")
 
 try:
     import serial
 except ImportError:
     serial = None
 
-from racket_fb import FB_TYPE_IMU, FB_TYPE_HIT, FrameReader, decode_imu, decode_hit
+from racket_fb import FB_TYPE_HIT, FB_TYPE_IMU, FrameReader, decode_hit, decode_imu
 
 
-# ── Dados ──────────────────────────────────────────────────────────────────────
+# ── configuração global do pyqtgraph ──────────────────────────────────────────
+pg.setConfigOptions(antialias=True, foreground="#e8eaf0", background="#0e1117")
+
+
+# ── helpers de geometria ───────────────────────────────────────────────────────
+
+def _rot_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+    r, p, y = map(math.radians, (roll_deg, pitch_deg, yaw_deg))
+    Rx = np.array([[1, 0,           0           ],
+                   [0, math.cos(r), -math.sin(r)],
+                   [0, math.sin(r),  math.cos(r)]])
+    Ry = np.array([[ math.cos(p), 0, math.sin(p)],
+                   [ 0,           1, 0           ],
+                   [-math.sin(p), 0, math.cos(p)]])
+    Rz = np.array([[math.cos(y), -math.sin(y), 0],
+                   [math.sin(y),  math.cos(y), 0],
+                   [0,            0,            1]])
+    return Rz @ Ry @ Rx
+
+
+# ── modelos de dados ───────────────────────────────────────────────────────────
 
 @dataclass
 class ImuSample:
-    t_pc:      float = 0.0
+    t_pc:      float        = 0.0
+    yaw_deg:   Optional[int] = None
+    roll_deg:  Optional[int] = None
+    pitch_deg: Optional[int] = None
     ax_mg:     Optional[int] = None
     ay_mg:     Optional[int] = None
     az_mg:     Optional[int] = None
-    roll_deg:  Optional[int] = None
-    pitch_deg: Optional[int] = None
-    yaw_deg:   Optional[int] = None
 
     @property
     def estado(self) -> str:
-        """Derive orientation state from roll/pitch (computed on the PC side)."""
+        """Orientation label derived from roll/pitch on the PC side."""
         if self.pitch_deg is None or self.roll_deg is None:
             return ""
-        if self.pitch_deg > 45:   return "FRENTE  >>>"
-        if self.pitch_deg < -45:  return "<<< ATRAS"
-        if self.roll_deg  > 45:   return "DIREITA vvv"
-        if self.roll_deg  < -45:  return "^^^ ESQUERDA"
-        return "PLANO  [===]"
+        if self.pitch_deg >  45: return "FRENTE  >>>"
+        if self.pitch_deg < -45: return "<<< ATRAS"
+        if self.roll_deg  >  45: return "DIREITA  v"
+        if self.roll_deg  < -45: return "^  ESQUERDA"
+        return "PLANO  ==="
 
 
 @dataclass
 class HitSample:
-    t_pc:         float = 0.0
-    timestamp_ms: int   = 0
-    region:       int   = 0
-    peak_raw:     int   = 0
+    t_pc:         float     = 0.0
+    timestamp_ms: int       = 0
+    region:       int       = 0
+    peak_raw:     int       = 0
     heatmap:      List[int] = field(default_factory=lambda: [0] * 9)
 
 
 Sample = Union[ImuSample, HitSample]
 
 
-# ── Fontes de dados ────────────────────────────────────────────────────────────
+# ── fontes de dados ────────────────────────────────────────────────────────────
 
 class SerialSource:
     def __init__(self, port: str, baud: int) -> None:
         if serial is None:
-            raise RuntimeError("pyserial não instalado: pip install pyserial")
+            raise RuntimeError("pyserial nao instalado: pip install pyserial")
         self.ser = serial.Serial(port=port, baudrate=baud, timeout=0.02)
         self.ser.reset_input_buffer()
         self._reader = FrameReader(self.ser)
@@ -87,7 +118,7 @@ class SerialSource:
 
     def read_samples(self) -> list[Sample]:
         samples: list[Sample] = []
-        for t, payload in self._reader.read_frames(timeout_s=0.08):
+        for t, payload in self._reader.read_frames(timeout_s=0.04):
             now = time.time()
             if t == FB_TYPE_IMU:
                 d = decode_imu(payload)
@@ -113,33 +144,33 @@ class SerialSource:
 
 
 class MockSource:
-    """Generates synthetic IMU and HIT samples without any hardware."""
+    """Generates synthetic IMU + HIT samples without hardware."""
 
     def __init__(self) -> None:
-        self.t0         = time.time()
-        self.last_imu   = -1.0
-        self.last_hit   = -1.0
-        self._heatmap   = [0] * 9
+        self.t0       = time.time()
+        self.last_imu = -1.0
+        self.last_hit = -1.0
+        self._heatmap = [0] * 9
 
     def read_samples(self) -> list[Sample]:
         samples: list[Sample] = []
         now = time.time() - self.t0
 
-        # ── IMU samples at 4 Hz ──────────────────────────────────────────
-        while self.last_imu + 0.25 <= now:
-            self.last_imu += 0.25
+        # IMU at 20 Hz (matching vTaskIMU)
+        while self.last_imu + 0.05 <= now:
+            self.last_imu += 0.05
             t = self.last_imu
             samples.append(ImuSample(
                 t_pc      = time.time(),
-                ax_mg     = int(450 * math.sin(2.1 * t)),
-                ay_mg     = int(280 * math.cos(1.6 * t)),
-                az_mg     = int(1000 + 100 * math.sin(3.3 * t)),
-                roll_deg  = int(28  * math.sin(1.2 * t)),
-                pitch_deg = int(22  * math.cos(0.9 * t)),
                 yaw_deg   = int(35  * math.sin(0.45 * t)),
+                roll_deg  = int(28  * math.sin(1.20 * t)),
+                pitch_deg = int(22  * math.cos(0.90 * t)),
+                ax_mg     = int(450 * math.sin(2.10 * t)),
+                ay_mg     = int(280 * math.cos(1.60 * t)),
+                az_mg     = int(1000 + 100 * math.sin(3.30 * t)),
             ))
 
-        # ── Sporadic HIT samples ~once per second ────────────────────────
+        # Sporadic hits ~once per second
         if now > 1.0 and now - self.last_hit >= 1.0 and random.random() < 0.4:
             self.last_hit = now
             region = random.randint(0, 8)
@@ -155,255 +186,345 @@ class MockSource:
         return samples
 
 
-# ── Geometria 3D ───────────────────────────────────────────────────────────────
+# ── dashboard ──────────────────────────────────────────────────────────────────
 
-def rotation_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
-    r, p, y = map(math.radians, (roll_deg, pitch_deg, yaw_deg))
-    Rx = np.array([[1,0,0],[0,math.cos(r),-math.sin(r)],[0,math.sin(r),math.cos(r)]])
-    Ry = np.array([[math.cos(p),0,math.sin(p)],[0,1,0],[-math.sin(p),0,math.cos(p)]])
-    Rz = np.array([[math.cos(y),-math.sin(y),0],[math.sin(y),math.cos(y),0],[0,0,1]])
-    return Rz @ Ry @ Rx
+_C_BG     = "#0e1117"
+_C_PANEL  = "#161b22"
+_C_BORDER = "#30363d"
+_C_TICK   = "#6e7681"
+_C_TEXT   = "#e8eaf0"
+_C_ANGLE  = "#58a6ff"
+_C_ACC    = "#f78166"
+_C_GREEN  = "#3fb950"
+_C_ORANGE = "#f0883e"
 
-def transform(pts: np.ndarray, roll: float, pitch: float, yaw: float) -> np.ndarray:
-    return pts @ rotation_matrix(roll, pitch, yaw).T
+_ESTADO_STYLE: dict[str, tuple[str, str]] = {
+    "FRENTE":   ("FRENTE  >>>", _C_ORANGE),
+    "ATRAS":    ("<<< ATRAS",   _C_ORANGE),
+    "DIREITA":  ("DIREITA  v",  _C_ANGLE),
+    "ESQUERDA": ("^  ESQUERDA", _C_ANGLE),
+    "PLANO":    ("PLANO  ===",  _C_GREEN),
+}
 
 
-# ── Dashboard ──────────────────────────────────────────────────────────────────
+class Dashboard(QMainWindow):
 
-class Dashboard:
-    WINDOW = 200
+    WINDOW = 400  # 400 samples * 50 ms = 20 s rolling window
 
-    def __init__(self, source) -> None:
-        self.source      = source
-        self.samples:   Deque[ImuSample] = deque(maxlen=self.WINDOW)
-        self._heatmap   = [0] * 9
+    def __init__(self, source: SerialSource | MockSource) -> None:
+        super().__init__()
+        self.source   = source
+        self.samples: Deque[ImuSample] = deque(maxlen=self.WINDOW)
+        self._heatmap = [0] * 9
 
-        # ── figura ──────────────────────────────────────────────────────────
-        self.fig = plt.figure(figsize=(16, 8), facecolor="#0e1117")
-        self.fig.suptitle("Raquete instrumentada — telemetria IMU",
-                          color="#e8eaf0", fontsize=13, fontweight="bold", y=0.98)
+        self.setWindowTitle("Raquete instrumentada — telemetria IMU")
+        self.resize(1440, 820)
+        self.setStyleSheet(f"background: {_C_BG};")
 
-        gs = gridspec.GridSpec(3, 3, figure=self.fig,
-                               width_ratios=[1.1, 1.1, 1.2],
-                               hspace=0.55, wspace=0.35)
+        # ── central widget ───────────────────────────────────────────────
+        central = QWidget()
+        self.setCentralWidget(central)
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
 
-        def make_ax(row, col, title, color):
-            ax = self.fig.add_subplot(gs[row, col])
-            ax.set_facecolor("#161b22")
-            ax.set_title(title, color=color, fontsize=9, pad=4)
-            ax.tick_params(colors="#6e7681", labelsize=8)
-            for sp in ax.spines.values():
-                sp.set_edgecolor("#30363d")
-            ax.grid(True, color="#21262d", linewidth=0.5, linestyle="--")
-            line, = ax.plot([], [], color=color, linewidth=1.4)
-            return ax, line
+        # Left: plots + heatmap in a GraphicsLayoutWidget, plus estado label
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
 
-        angle_color = "#58a6ff"
-        acc_color   = "#f78166"
+        self._glw = pg.GraphicsLayoutWidget()
+        self._glw.setBackground(_C_BG)
+        left_layout.addWidget(self._glw, stretch=1)
 
-        self.ax_yaw,   self.ln_yaw   = make_ax(0, 0, "Yaw (°)",           angle_color)
-        self.ax_roll,  self.ln_roll  = make_ax(0, 1, "Roll (°)",           angle_color)
-        self.ax_pitch, self.ln_pitch = make_ax(1, 0, "Pitch (°)",          angle_color)
-        self.ax_ax,    self.ln_ax    = make_ax(1, 1, "Aceleração X (mg)",  acc_color)
-        self.ax_ay,    self.ln_ay    = make_ax(2, 0, "Aceleração Y (mg)",  acc_color)
+        self._lbl_estado = QLabel("Aguardando dados...")
+        self._lbl_estado.setAlignment(Qt.AlignCenter)
+        self._lbl_estado.setStyleSheet(
+            f"color: {_C_TEXT}; font-size: 13px; font-weight: bold;"
+            f"background: {_C_PANEL}; border-radius: 4px; padding: 5px;")
+        left_layout.addWidget(self._lbl_estado)
 
-        self.all_axes  = [self.ax_yaw, self.ax_roll, self.ax_pitch,
-                          self.ax_ax,  self.ax_ay]
-        self.all_lines = [self.ln_yaw, self.ln_roll, self.ln_pitch,
-                          self.ln_ax,  self.ln_ay]
+        outer.addWidget(left_panel, stretch=3)
 
-        # ── heatmap de impactos (gs[2,1]) ────────────────────────────────
-        self.ax_hm = self.fig.add_subplot(gs[2, 1])
-        self.ax_hm.set_facecolor("#161b22")
-        self.ax_hm.set_title("Heatmap de impactos", color="#e8eaf0",
-                              fontsize=9, pad=4)
-        for sp in self.ax_hm.spines.values():
-            sp.set_edgecolor("#30363d")
-        self.ax_hm.set_xticks([])
-        self.ax_hm.set_yticks([])
+        # Right: 3D GL view
+        if _GL:
+            self.view3d = gl.GLViewWidget()
+            self.view3d.setBackgroundColor(pg.mkColor(_C_BG))
+            self.view3d.setCameraPosition(distance=3.5, elevation=20, azimuth=45)
+            outer.addWidget(self.view3d, stretch=2)
 
-        self._hm_img = self.ax_hm.imshow(
-            np.zeros((3, 3)), cmap="inferno", aspect="auto",
-            vmin=0, vmax=1, origin="upper")
-        self._hm_texts = [
-            self.ax_hm.text(c, r, "0",
-                            ha="center", va="center",
-                            fontsize=11, color="white", fontweight="bold")
-            for r in range(3) for c in range(3)
+        # ── build sub-widgets ────────────────────────────────────────────
+        self._setup_plots()
+        self._setup_heatmap()
+        if _GL:
+            self._setup_3d()
+
+        # ── 50 ms timer — 20 Hz, matching vTaskIMU ───────────────────────
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(50)
+
+    # ── plots ──────────────────────────────────────────────────────────────────
+
+    def _make_plot(self, row: int, col: int, title: str,
+                   pen: pg.mkPen) -> tuple[pg.PlotItem, pg.PlotDataItem]:
+        p = self._glw.addPlot(row=row, col=col)
+        p.setTitle(title, color=_C_TICK, size="9pt")
+        for axis in ("left", "bottom"):
+            ax = p.getAxis(axis)
+            ax.setPen(_C_BORDER)
+            ax.setTextPen(_C_TICK)
+            ax.setStyle(tickFont=QFont("monospace", 7))
+        p.showGrid(x=True, y=True, alpha=0.25)
+        p.setMenuEnabled(False)
+        p.setMouseEnabled(x=False, y=True)
+        p.setDownsampling(auto=True, mode="peak")
+        curve = p.plot(pen=pen)
+        return p, curve
+
+    def _setup_plots(self) -> None:
+        a_pen = pg.mkPen(_C_ANGLE, width=1.5)
+        c_pen = pg.mkPen(_C_ACC,   width=1.5)
+
+        defs = [
+            (0, 0, "Yaw (graus)",       a_pen),
+            (0, 1, "Roll (graus)",      a_pen),
+            (1, 0, "Pitch (graus)",     a_pen),
+            (1, 1, "Aceleracao X (mg)", c_pen),
+            (2, 0, "Aceleracao Y (mg)", c_pen),
         ]
-        self.txt_estado = self.ax_hm.text(
-            0.5, -0.14, "Aguardando dados...",
-            ha="center", va="top", fontsize=9, fontweight="bold",
-            color="#e8eaf0", transform=self.ax_hm.transAxes)
 
-        # ── 3D ──────────────────────────────────────────────────────────
-        self.ax3d = self.fig.add_subplot(gs[:, 2], projection="3d")
-        self.ax3d.set_facecolor("#0e1117")
-        self.ax3d.set_title("Orientação 3D", color="#e8eaf0", fontsize=9, pad=6)
+        self._plots:  dict[str, pg.PlotItem]     = {}
+        self._curves: dict[str, pg.PlotDataItem] = {}
 
-        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        for row, col, title, pen in defs:
+            plot, curve = self._make_plot(row, col, title, pen)
+            self._plots[title]  = plot
+            self._curves[title] = curve
 
-    # ── atualização ───────────────────────────────────────────────────────────
+        for c in (0, 1):
+            self._glw.ci.layout.setColumnStretchFactor(c, 1)
 
-    def update(self, _frame):
+    # ── heatmap ────────────────────────────────────────────────────────────────
+
+    def _setup_heatmap(self) -> None:
+        hm = self._glw.addPlot(row=2, col=1)
+        hm.setTitle("Heatmap de impactos", color=_C_TICK, size="9pt")
+        hm.hideAxis("left")
+        hm.hideAxis("bottom")
+        hm.setAspectLocked(True)
+        hm.setRange(xRange=[0, 3], yRange=[0, 3], padding=0.02)
+        hm.getViewBox().invertY(True)
+        hm.setMenuEnabled(False)
+        hm.setMouseEnabled(x=False, y=False)
+
+        cmap = pg.colormap.get("inferno")
+
+        self._hm_img = pg.ImageItem(np.zeros((3, 3)))
+        self._hm_img.setColorMap(cmap)
+        self._hm_img.setLevels((0, 1))
+        self._hm_img.setRect(0, 0, 3, 3)
+        hm.addItem(self._hm_img)
+
+        div_pen = pg.mkPen(_C_BORDER, width=1)
+        for v in (1, 2):
+            hm.addItem(pg.InfiniteLine(pos=v, angle=90, pen=div_pen))
+            hm.addItem(pg.InfiniteLine(pos=v, angle=0,  pen=div_pen))
+
+        cell_font = QFont("monospace")
+        cell_font.setPointSize(11)
+        cell_font.setBold(True)
+
+        self._hm_texts: list[pg.TextItem] = []
+        for idx in range(9):
+            r, c = divmod(idx, 3)
+            t = pg.TextItem("0", anchor=(0.5, 0.5), color="w")
+            t.setFont(cell_font)
+            t.setPos(c + 0.5, r + 0.5)
+            hm.addItem(t)
+            self._hm_texts.append(t)
+
+    # ── 3D view ────────────────────────────────────────────────────────────────
+
+    _HEAD_R  = 0.42
+    _HEAD_CY = 0.28
+    _STR_R   = 0.42 * 0.85
+    _STR_OFF = 0.42 * 0.85 / 2.5
+
+    def _setup_3d(self) -> None:
+        grid = gl.GLGridItem()
+        grid.setSize(3, 3, 0)
+        grid.setSpacing(0.5, 0.5, 0.5)
+        grid.setColor(pg.mkColor(_C_BORDER))
+        self.view3d.addItem(grid)
+
+        # Base geometry in the identity orientation (z=0 plane)
+        theta = np.linspace(0, 2 * math.pi, 65, dtype=np.float32)
+        self._base_circle = np.column_stack([
+            self._HEAD_R * np.cos(theta),
+            self._HEAD_CY + self._HEAD_R * np.sin(theta),
+            np.zeros(65, dtype=np.float32),
+        ])
+
+        self._base_handle = np.array([
+            [-0.10, -1.00, 0.0],
+            [ 0.10, -1.00, 0.0],
+            [ 0.13, -0.05, 0.0],
+            [-0.13, -0.05, 0.0],
+            [-0.10, -1.00, 0.0],
+        ], dtype=np.float32)
+
+        sr, so, cy = self._STR_R, self._STR_OFF, self._HEAD_CY
+        self._base_strings = [
+            np.array([[-so, cy - sr, 0], [-so, cy + sr, 0]], dtype=np.float32),
+            np.array([[ so, cy - sr, 0], [ so, cy + sr, 0]], dtype=np.float32),
+            np.array([[-sr, cy - so, 0], [ sr, cy - so, 0]], dtype=np.float32),
+            np.array([[-sr, cy + so, 0], [ sr, cy + so, 0]], dtype=np.float32),
+        ]
+
+        self._gl_head = gl.GLLinePlotItem(
+            pos=self._base_circle,
+            color=(0.14, 0.52, 0.21, 1.0), width=2.5, antialias=True)
+        self.view3d.addItem(self._gl_head)
+
+        self._gl_handle = gl.GLLinePlotItem(
+            pos=self._base_handle,
+            color=(0.55, 0.38, 0.16, 1.0), width=2.5, antialias=True)
+        self.view3d.addItem(self._gl_handle)
+
+        str_color = (0.34, 0.63, 0.83, 0.55)
+        self._gl_strings: list[gl.GLLinePlotItem] = []
+        for seg in self._base_strings:
+            item = gl.GLLinePlotItem(pos=seg, color=str_color,
+                                     width=1.2, antialias=True)
+            self.view3d.addItem(item)
+            self._gl_strings.append(item)
+
+        # X=red  Y=green  Z=blue
+        axis_colors = [
+            (0.97, 0.49, 0.40, 1.0),
+            (0.24, 0.71, 0.31, 1.0),
+            (0.34, 0.65, 1.00, 1.0),
+        ]
+        self._gl_axes: list[gl.GLLinePlotItem] = []
+        for c in axis_colors:
+            item = gl.GLLinePlotItem(
+                pos=np.zeros((2, 3), dtype=np.float32),
+                color=c, width=2.0, antialias=True)
+            self.view3d.addItem(item)
+            self._gl_axes.append(item)
+
+    def _update_3d(self, roll: float, pitch: float, yaw: float) -> None:
+        R = _rot_matrix(roll, pitch, yaw).astype(np.float32)
+
+        self._gl_head.setData(pos=(self._base_circle @ R.T))
+        self._gl_handle.setData(pos=(self._base_handle @ R.T))
+
+        for item, seg in zip(self._gl_strings, self._base_strings):
+            item.setData(pos=(seg @ R.T))
+
+        origin = np.zeros(3, dtype=np.float32)
+        for i, ax_item in enumerate(self._gl_axes):
+            tip = np.zeros(3, dtype=np.float32)
+            tip[i] = 0.65
+            ax_item.setData(
+                pos=np.array([origin, tip @ R.T], dtype=np.float32))
+
+    # ── tick ───────────────────────────────────────────────────────────────────
+
+    def _tick(self) -> None:
         for s in self.source.read_samples():
             if isinstance(s, ImuSample):
                 self.samples.append(s)
             elif isinstance(s, HitSample):
                 self._heatmap = s.heatmap[:]
 
-        if self.samples:
-            self._update_graphs()
-            self._update_heatmap(self.samples[-1])
-            self._update_3d(self.samples[-1])
-        else:
-            self._update_3d(None)
+        if not self.samples:
+            return
 
-        return self.all_lines
+        self._update_plots()
+        self._update_heatmap()
 
-    def _update_graphs(self) -> None:
-        data = list(self.samples)
-        t0   = data[0].t_pc
-        t    = np.array([(s.t_pc - t0) for s in data])
+        last = self.samples[-1]
+        if _GL:
+            self._update_3d(
+                last.roll_deg  or 0.0,
+                last.pitch_deg or 0.0,
+                last.yaw_deg   or 0.0,
+            )
+        self._update_estado(last)
 
-        series = [
-            [s.yaw_deg   for s in data],
-            [s.roll_deg  for s in data],
-            [s.pitch_deg for s in data],
-            [s.ax_mg     for s in data],
-            [s.ay_mg     for s in data],
-        ]
+    def _update_plots(self) -> None:
+        data  = list(self.samples)
+        t0    = data[0].t_pc
+        t_arr = np.fromiter(
+            (s.t_pc - t0 for s in data), dtype=np.float64, count=len(data))
 
-        t_end  = t[-1]
-        t_from = max(0.0, t_end - 15.0)
+        t_end  = t_arr[-1]
+        t_from = max(0.0, t_end - 20.0)
 
-        for ax, line, y in zip(self.all_axes, self.all_lines, series):
-            line.set_data(t, y)
-            ax.relim()
-            ax.autoscale_view()
-            ax.set_xlim(t_from, max(15.0, t_end + 0.5))
-
-    def _update_heatmap(self, s: ImuSample) -> None:
-        # Colour grid
-        data = np.array(self._heatmap, dtype=float).reshape(3, 3)
-        self._hm_img.set_data(data)
-        mx = data.max()
-        self._hm_img.set_clim(0, max(mx, 1))
-        for idx, txt in enumerate(self._hm_texts):
-            txt.set_text(str(self._heatmap[idx]))
-
-        # Orientation label below the grid
-        estado_map = {
-            "FRENTE":   ("FRENTE  >>>", "#f0883e"),
-            "ATRAS":    ("<<< ATRÁS",   "#f0883e"),
-            "DIREITA":  ("DIREITA  ↓",  "#58a6ff"),
-            "ESQUERDA": ("↑  ESQUERDA", "#58a6ff"),
-            "PLANO":    ("PLANO  ═══",  "#3fb950"),
+        attrs = {
+            "Yaw (graus)":       "yaw_deg",
+            "Roll (graus)":      "roll_deg",
+            "Pitch (graus)":     "pitch_deg",
+            "Aceleracao X (mg)": "ax_mg",
+            "Aceleracao Y (mg)": "ay_mg",
         }
-        texto, cor = s.estado, "#e8eaf0"
-        for key, (label, c) in estado_map.items():
-            if key in s.estado.upper():
+        for title, attr in attrs.items():
+            y = np.fromiter(
+                (getattr(s, attr) or 0 for s in data),
+                dtype=np.float32, count=len(data))
+            self._curves[title].setData(t_arr, y)
+            self._plots[title].setXRange(
+                t_from, max(20.0, t_end + 0.5), padding=0)
+
+    def _update_heatmap(self) -> None:
+        data = np.array(self._heatmap, dtype=np.float32).reshape(3, 3)
+        mx   = float(data.max())
+        self._hm_img.setImage(data)
+        self._hm_img.setLevels((0.0, max(mx, 1.0)))
+        for idx, txt in enumerate(self._hm_texts):
+            txt.setText(str(self._heatmap[idx]))
+
+    def _update_estado(self, s: ImuSample) -> None:
+        texto = s.estado or "Aguardando dados..."
+        cor   = _C_TEXT
+        for key, (label, c) in _ESTADO_STYLE.items():
+            if key in texto.upper():
                 texto, cor = label, c
                 break
-        self.txt_estado.set_text(texto)
-        self.txt_estado.set_color(cor)
-
-    def _update_3d(self, s: Optional[ImuSample]) -> None:
-        ax = self.ax3d
-        ax.cla()
-        ax.set_facecolor("#0e1117")
-        ax.set_title("Orientação 3D", color="#e8eaf0", fontsize=9, pad=6)
-        ax.set_xlim(-1.2, 1.2); ax.set_ylim(-1.2, 1.2); ax.set_zlim(-1.2, 1.2)
-        ax.set_xlabel("X", color="#6e7681", fontsize=8)
-        ax.set_ylabel("Y", color="#6e7681", fontsize=8)
-        ax.set_zlabel("Z", color="#6e7681", fontsize=8)
-        ax.tick_params(colors="#6e7681", labelsize=7)
-        for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
-            pane.fill = False
-            pane.set_edgecolor("#21262d")
-
-        roll  = s.roll_deg  if s else 0.0
-        pitch = s.pitch_deg if s else 0.0
-        yaw   = s.yaw_deg   if s else 0.0
-
-        theta  = np.linspace(0, 2 * math.pi, 64)
-        radius = 0.42
-        cy     = 0.28
-        circle = np.column_stack([radius * np.cos(theta),
-                                  cy + radius * np.sin(theta),
-                                  np.zeros_like(theta)])
-        handle = np.array([[-0.10, -1.00, 0.0], [ 0.10, -1.00, 0.0],
-                           [ 0.13, -0.05, 0.0], [-0.13, -0.05, 0.0]])
-        dz = 0.035
-
-        cf = transform(circle + [0, 0,  dz], roll, pitch, yaw)
-        cb = transform(circle + [0, 0, -dz], roll, pitch, yaw)
-        hf = transform(handle + [0, 0,  dz], roll, pitch, yaw)
-        hb = transform(handle + [0, 0, -dz], roll, pitch, yaw)
-
-        ax.add_collection3d(Poly3DCollection([cf], alpha=0.55,
-                            facecolor="#238636", edgecolor="#3fb950"))
-        ax.add_collection3d(Poly3DCollection([cb], alpha=0.20,
-                            facecolor="#238636", edgecolor="none"))
-        ax.add_collection3d(Poly3DCollection([hf], alpha=0.65,
-                            facecolor="#6e4c1e", edgecolor="#9e6b2e"))
-        ax.add_collection3d(Poly3DCollection([hb], alpha=0.25,
-                            facecolor="#6e4c1e", edgecolor="none"))
-
-        ax.plot(cf[:, 0], cf[:, 1], cf[:, 2], color="#3fb950", linewidth=1.2)
-        ch = np.vstack([hf, hf[0]])
-        ax.plot(ch[:, 0], ch[:, 1], ch[:, 2], color="#9e6b2e", linewidth=1.2)
-
-        for x in [-radius / 3, radius / 3]:
-            ln = np.array([[x, cy - radius, dz * 1.5], [x, cy + radius, dz * 1.5]])
-            r  = transform(ln, roll, pitch, yaw)
-            ax.plot(r[:, 0], r[:, 1], r[:, 2], color="#58a6ff", linewidth=0.6, alpha=0.6)
-        for yl in [cy - radius / 3, cy + radius / 3]:
-            ln = np.array([[-radius, yl, dz * 1.5], [radius, yl, dz * 1.5]])
-            r  = transform(ln, roll, pitch, yaw)
-            ax.plot(r[:, 0], r[:, 1], r[:, 2], color="#58a6ff", linewidth=0.6, alpha=0.6)
-
-        R = rotation_matrix(roll, pitch, yaw)
-        origin = np.zeros(3)
-        for i, c in enumerate(["#f78166", "#3fb950", "#58a6ff"]):
-            v = R[i] * 0.6
-            ax.quiver(*origin, *v, color=c, linewidth=1.2, arrow_length_ratio=0.2)
-
-        label = ("sem dados" if s is None
-                 else f"yaw={yaw:.0f}°  roll={roll:.0f}°  pitch={pitch:.0f}°")
-        ax.text2D(0.02, 0.02, label, transform=ax.transAxes,
-                  color="#8b949e", fontsize=7)
-
-    # ── loop principal ────────────────────────────────────────────────────────
-
-    def run(self) -> None:
-        self.anim = animation.FuncAnimation(
-            self.fig, self.update,
-            interval=80, blit=False, cache_frame_data=False)
-        plt.show()
+        self._lbl_estado.setText(texto)
+        self._lbl_estado.setStyleSheet(
+            f"color: {cor}; font-size: 13px; font-weight: bold;"
+            f"background: {_C_PANEL}; border-radius: 4px; padding: 5px;")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Dashboard telemetria raquete")
-    ap.add_argument("--port", help="Ex.: COM3 ou /dev/ttyUSB0")
+    ap.add_argument("--port", help="Porta serial (ex.: COM3, /dev/ttyUSB0)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--mock", "--simulate", action="store_true",
-                    help="Dados falsos sem hardware")
+                    help="Dados simulados sem hardware")
     args = ap.parse_args()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Telemetria Raquete")
 
     if args.mock:
         print("[INFO] Modo mock ativo\n")
-        source = MockSource()
+        source: SerialSource | MockSource = MockSource()
     elif args.port:
         source = SerialSource(args.port, args.baud)
     else:
         print("Erro: passe --port COMx ou use --mock", file=sys.stderr)
         return 2
 
-    Dashboard(source).run()
-    return 0
+    dash = Dashboard(source)
+    dash.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
