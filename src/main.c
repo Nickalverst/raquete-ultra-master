@@ -27,12 +27,10 @@
 #include "delay.h"
 #include "st7789.h"
 #include "racket_types.h"
-
-/* ─── Identificação da raquete ───────────────────────────── */
-#define RACKET_ID   "RAQ01"
+#include "flatbuf.h"
 
 /* ─── Thresholds e dimensões ─────────────────────────────── */
-#define ADC_IMPACT_THRESHOLD   1000u
+#define ADC_IMPACT_THRESHOLD   1100u
 #define ADC_CHANNELS           9u
 #define DEBOUNCE_MS            120u   /* ms entre dois hits no mesmo sensor */
 
@@ -230,52 +228,63 @@ static void vTaskADC(void *arg)
 }
 
 /* ================================================================
- * Task 3 — Transmissão serial (HC-12)
+ * Task 3 — Transmissão serial (HC-12) — protocolo FlatBuffers
  * Prioridade: 1  |  Bloqueante nas filas
+ *
+ * Formato do frame no fio:
+ *   [type : uint8][len_lo : uint8][len_hi : uint8][payload : len bytes]
+ *   type 0x01 = ImuPacket  (42 bytes)
+ *   type 0x02 = HitPacket  (54 bytes)
+ *
+ * O mutex protege a sequência header+payload de interferências
+ * entre os dois tipos de pacote.
  * ================================================================ */
 static void vTaskTX(void *arg)
 {
     (void)arg;
-    static char buf[256];
 
     for (;;)
     {
+        /* ── IMU ── */
         imu_data_t imu_pkt;
         while (xQueueReceive(xQueueIMU, &imu_pkt, 0) == pdTRUE)
         {
-            snprintf(buf, sizeof(buf),
-                "$RAQ,%s,%lu,%d,%d,%d,%d,%d,%d\r\n",
-                RACKET_ID,
-                (unsigned long)imu_pkt.timestamp_ms,
-                (int)imu_pkt.yaw_deg,
-                (int)imu_pkt.roll_deg,
-                (int)imu_pkt.pitch_deg,
-                (int)imu_pkt.ax_mg,
-                (int)imu_pkt.ay_mg,
-                (int)imu_pkt.az_mg);
+            uint8_t fb[FB_IMU_SIZE];
+            fb_build_imu(fb,
+                         imu_pkt.timestamp_ms,
+                         imu_pkt.yaw_deg,
+                         imu_pkt.roll_deg,
+                         imu_pkt.pitch_deg,
+                         imu_pkt.ax_mg,
+                         imu_pkt.ay_mg,
+                         imu_pkt.az_mg);
 
             xSemaphoreTake(xUartMutex, portMAX_DELAY);
-            serial_write(buf);
+            serial_putc(FB_TYPE_IMU);
+            serial_putc((uint8_t)(FB_IMU_SIZE & 0xFFu));
+            serial_putc((uint8_t)(FB_IMU_SIZE >> 8));
+            for (int i = 0; i < FB_IMU_SIZE; i++)
+                serial_putc(fb[i]);
             xSemaphoreGive(xUartMutex);
         }
 
+        /* ── HIT ── */
         hit_data_t hit_pkt;
         while (xQueueReceive(xQueueHit, &hit_pkt, 0) == pdTRUE)
         {
-            snprintf(buf, sizeof(buf),
-                "$HIT,%s,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\r\n",
-                RACKET_ID,
-                (unsigned long)hit_pkt.timestamp_ms,
-                (unsigned)hit_pkt.region,
-                (unsigned)hit_pkt.peak_raw,
-                (unsigned)hit_pkt.heatmap[0], (unsigned)hit_pkt.heatmap[1],
-                (unsigned)hit_pkt.heatmap[2], (unsigned)hit_pkt.heatmap[3],
-                (unsigned)hit_pkt.heatmap[4], (unsigned)hit_pkt.heatmap[5],
-                (unsigned)hit_pkt.heatmap[6], (unsigned)hit_pkt.heatmap[7],
-                (unsigned)hit_pkt.heatmap[8]);
+            uint8_t fb[FB_HIT_SIZE];
+            fb_build_hit(fb,
+                         hit_pkt.timestamp_ms,
+                         hit_pkt.region,
+                         hit_pkt.peak_raw,
+                         hit_pkt.heatmap);
 
             xSemaphoreTake(xUartMutex, portMAX_DELAY);
-            serial_write(buf);
+            serial_putc(FB_TYPE_HIT);
+            serial_putc((uint8_t)(FB_HIT_SIZE & 0xFFu));
+            serial_putc((uint8_t)(FB_HIT_SIZE >> 8));
+            for (int i = 0; i < FB_HIT_SIZE; i++)
+                serial_putc(fb[i]);
             xSemaphoreGive(xUartMutex);
         }
 
