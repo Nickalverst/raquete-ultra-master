@@ -18,12 +18,12 @@ static void spi1_init_mode3_div(uint8_t br_div){
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN;
     RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
 
-    /* PA5 SCK, PA7 MOSI, AF5 */
-    GPIOA->MODER   &= ~((3u<<(5*2))|(3u<<(7*2)));
-    GPIOA->MODER   |=  (2u<<(5*2))|(2u<<(7*2));
-    GPIOA->AFR[0]  &= ~((0xFu<<(5*4))|(0xFu<<(7*4)));
-    GPIOA->AFR[0]  |=  (5u<<(5*4))|(5u<<(7*4));
-    GPIOA->OSPEEDR |=  (3u<<(5*2))|(3u<<(7*2));
+    /* PB3 SCK, PB5 MOSI, AF5 (Pinos alternativos do SPI1) */
+    GPIOB->MODER   &= ~((3u<<(3*2))|(3u<<(5*2)));
+    GPIOB->MODER   |=  (2u<<(3*2))|(2u<<(5*2));
+    GPIOB->AFR[0]  &= ~((0xFu<<(3*4))|(0xFu<<(5*4)));
+    GPIOB->AFR[0]  |=  (5u<<(3*4))|(5u<<(5*4));
+    GPIOB->OSPEEDR |=  (3u<<(3*2))|(3u<<(5*2));
 
     /* DC/RST/BLK/CS -> saída */
     GPIOB->MODER   &= ~((3u<<(LCD_DC_PIN*2))|(3u<<(LCD_RST_PIN*2))|(3u<<(LCD_BLK_PIN*2))|(3u<<(LCD_CS_PIN*2)));

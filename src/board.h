@@ -7,7 +7,7 @@
 
 /* Pinos (mapeamento que funcionou) */
 #define LCD_DC_PORT   GPIOB
-#define LCD_DC_PIN    0
+#define LCD_DC_PIN    2
 #define LCD_RST_PORT  GPIOB
 #define LCD_RST_PIN   1
 #define LCD_BLK_PORT  GPIOB
@@ -15,7 +15,7 @@
 #define LCD_CS_PORT   GPIOB  /* opcional; manter LOW evita flutuação */
 #define LCD_CS_PIN    10
 
-/* SPI1: SCK=PA5, MOSI=PA7 (MISO não usado) */
+/* SPI1: SCK=PB3, MOSI=PB5 (MISO não usado) */
 
 /* Cores 16-bit RGB565 úteis */
 #define C_BLACK 0x0000
